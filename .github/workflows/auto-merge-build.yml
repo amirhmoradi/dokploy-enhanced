@@ -205,32 +205,33 @@ jobs:
           echo "Environment files prepared successfully"
           ls -la .env.production apps/dokploy/.env.production
 
-      - name: Patch Dockerfile to upgrade corepack
+      - name: Patch Dockerfile to fix build issues
         run: |
           cd dokploy-source
-          # Fix corepack signature validation issues by upgrading to a version with updated keys
+          # Fix corepack and pnpm issues for reliable builds
+          #
+          # Problem: corepack signature validation fails with newer pnpm versions
+          # Problem: corepack@latest or @0.31.0 might default to pnpm 10 which blocks
+          #          native module builds (bcrypt, sharp) due to security features
           # See: https://github.com/nodejs/corepack/issues/612
-          # See: https://github.com/pnpm/pnpm/issues/9029
+          # See: https://github.com/pnpm/pnpm/issues/9042
           #
-          # The bundled corepack in Node images may have outdated signing keys,
-          # causing "Cannot find matching keyid" errors when installing pnpm.
-          #
-          # We use corepack@0.31.0 (not @latest) because:
-          # - 0.31.0+ has the updated npm registry signing keys
-          # - @latest might pull incompatible versions that affect pnpm behavior
-          # - This ensures reproducible builds
+          # Solution:
+          # 1. Set COREPACK_INTEGRITY_KEYS="" to bypass signature verification
+          # 2. Keep pnpm 9.x (as specified in Dockerfile) - DO NOT use pnpm 10
+          # 3. Use architecture-specific cache for native modules
 
           echo "Original Dockerfile (first 20 lines):"
           head -20 Dockerfile
 
-          # 1. Insert corepack upgrade before 'RUN corepack enable'
-          # Using 0.31.0 specifically as it's the minimum version with fixed keys
-          sed -i 's/RUN corepack enable/RUN npm install -g corepack@0.31.0 \&\& corepack enable/' Dockerfile
+          # 1. Add COREPACK_INTEGRITY_KEYS="" to bypass signature verification
+          #    This allows using pnpm 9.x without signature errors
+          #    Insert after the ENV PATH line in the base stage
+          sed -i '/ENV PATH="\$PNPM_HOME:\$PATH"/a ENV COREPACK_INTEGRITY_KEYS=""' Dockerfile
 
           # 2. Fix multi-arch builds: Use TARGETARCH in pnpm cache id
           # This prevents native modules (bcrypt, sharp, etc.) from different architectures
           # being mixed in the shared cache, which causes "Cannot find module" errors
-          # See: https://github.com/kelektiv/node.bcrypt.js/issues/800
           sed -i 's/--mount=type=cache,id=pnpm/--mount=type=cache,id=pnpm-${TARGETARCH}/' Dockerfile
 
           # 3. Add TARGETARCH build arg if not present (needed for cache key)
@@ -238,9 +239,32 @@ jobs:
             sed -i '/FROM .* AS build/a ARG TARGETARCH' Dockerfile
           fi
 
+          # 4. Verify pnpm version is 9.x in the Dockerfile (not 10.x)
+          echo ""
+          echo "Checking pnpm version in Dockerfile..."
+          if grep -q "pnpm@10" Dockerfile; then
+            echo "ERROR: Found pnpm 10 in Dockerfile - this will cause bcrypt build issues!"
+            echo "Downgrading to pnpm 9.12.0..."
+            sed -i 's/pnpm@10[0-9.]*/pnpm@9.12.0/g' Dockerfile
+          fi
+
+          # Also check package.json for packageManager field
+          if [ -f "package.json" ]; then
+            echo "Checking package.json for pnpm version..."
+            if grep -q '"pnpm@10' package.json; then
+              echo "WARNING: Found pnpm 10 in package.json packageManager field"
+              echo "Downgrading to pnpm 9.12.0..."
+              sed -i 's/"pnpm@10[0-9.]*"/"pnpm@9.12.0"/g' package.json
+            fi
+          fi
+
           echo ""
           echo "Patched Dockerfile (first 25 lines):"
           head -25 Dockerfile
+
+          echo ""
+          echo "Verifying pnpm version references:"
+          grep -n "pnpm@" Dockerfile || echo "No pnpm@ references found in Dockerfile"
 
       - name: Upload prepared source
         uses: actions/upload-artifact@v4
