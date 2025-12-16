@@ -1,0 +1,290 @@
+name: Auto-Merge PRs and Build Enhanced Dokploy
+
+on:
+  schedule:
+    # Run daily at 00:00 UTC
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+    inputs:
+      pr_numbers:
+        description: 'Comma-separated PR numbers to merge (overrides env variable)'
+        required: false
+        type: string
+      dokploy_branch:
+        description: 'Dokploy branch to use as base (default: canary)'
+        required: false
+        default: 'canary'
+        type: string
+      skip_build:
+        description: 'Skip Docker build (useful for testing merge only)'
+        required: false
+        default: false
+        type: boolean
+
+env:
+  # Configure PR numbers to merge (comma-separated)
+  # Example: "1234,5678,9012"
+  PR_NUMBERS_TO_MERGE: ${{ vars.PR_NUMBERS_TO_MERGE || '' }}
+
+  # Docker registry configuration
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/dokploy-enhanced
+
+  # Upstream Dokploy repository
+  UPSTREAM_REPO: Dokploy/dokploy
+  UPSTREAM_BRANCH: canary
+
+jobs:
+  merge-and-build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    outputs:
+      merged_prs: ${{ steps.merge-prs.outputs.merged_prs }}
+      failed_prs: ${{ steps.merge-prs.outputs.failed_prs }}
+      build_date: ${{ steps.meta.outputs.build_date }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Git
+        run: |
+          git config --global user.name "GitHub Actions Bot"
+          git config --global user.email "actions@github.com"
+
+      - name: Clone upstream Dokploy repository
+        run: |
+          BRANCH="${{ inputs.dokploy_branch || env.UPSTREAM_BRANCH }}"
+          echo "Cloning upstream Dokploy from branch: $BRANCH"
+          git clone --depth=1 --branch "$BRANCH" "https://github.com/${{ env.UPSTREAM_REPO }}.git" dokploy-source
+          cd dokploy-source
+          git fetch --unshallow || true
+          echo "UPSTREAM_SHA=$(git rev-parse HEAD)" >> $GITHUB_ENV
+          echo "Upstream SHA: $(git rev-parse HEAD)"
+
+      - name: Determine PRs to merge
+        id: determine-prs
+        run: |
+          # Use workflow input if provided, otherwise use env variable
+          if [ -n "${{ inputs.pr_numbers }}" ]; then
+            PR_LIST="${{ inputs.pr_numbers }}"
+          else
+            PR_LIST="${{ env.PR_NUMBERS_TO_MERGE }}"
+          fi
+
+          echo "PR_LIST=$PR_LIST" >> $GITHUB_ENV
+          echo "PRs to merge: $PR_LIST"
+
+          if [ -z "$PR_LIST" ]; then
+            echo "No PRs configured to merge"
+            echo "has_prs=false" >> $GITHUB_OUTPUT
+          else
+            echo "has_prs=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Fetch and merge PRs
+        id: merge-prs
+        if: steps.determine-prs.outputs.has_prs == 'true'
+        run: |
+          cd dokploy-source
+
+          MERGED_PRS=""
+          FAILED_PRS=""
+
+          # Parse comma-separated PR numbers
+          IFS=',' read -ra PRS <<< "${{ env.PR_LIST }}"
+
+          for PR_NUM in "${PRS[@]}"; do
+            PR_NUM=$(echo "$PR_NUM" | tr -d ' ')
+
+            if [ -z "$PR_NUM" ]; then
+              continue
+            fi
+
+            echo "=========================================="
+            echo "Processing PR #$PR_NUM"
+            echo "=========================================="
+
+            # Fetch PR information using GitHub API
+            PR_INFO=$(curl -s -H "Accept: application/vnd.github.v3+json" \
+              "https://api.github.com/repos/${{ env.UPSTREAM_REPO }}/pulls/$PR_NUM")
+
+            PR_STATE=$(echo "$PR_INFO" | jq -r '.state')
+            PR_TITLE=$(echo "$PR_INFO" | jq -r '.title')
+            PR_HEAD_SHA=$(echo "$PR_INFO" | jq -r '.head.sha')
+            PR_HEAD_REF=$(echo "$PR_INFO" | jq -r '.head.ref')
+            PR_HEAD_REPO=$(echo "$PR_INFO" | jq -r '.head.repo.full_name')
+
+            echo "PR Title: $PR_TITLE"
+            echo "PR State: $PR_STATE"
+            echo "PR Head SHA: $PR_HEAD_SHA"
+            echo "PR Head Ref: $PR_HEAD_REF"
+            echo "PR Head Repo: $PR_HEAD_REPO"
+
+            if [ "$PR_STATE" = "null" ] || [ -z "$PR_STATE" ]; then
+              echo "::warning::PR #$PR_NUM not found"
+              FAILED_PRS="${FAILED_PRS}${PR_NUM}(not found),"
+              continue
+            fi
+
+            # Fetch the PR's commits
+            echo "Fetching PR #$PR_NUM from $PR_HEAD_REPO..."
+            git fetch "https://github.com/$PR_HEAD_REPO.git" "$PR_HEAD_REF" || {
+              echo "::warning::Failed to fetch PR #$PR_NUM"
+              FAILED_PRS="${FAILED_PRS}${PR_NUM}(fetch failed),"
+              continue
+            }
+
+            # Try to merge the PR
+            echo "Merging PR #$PR_NUM..."
+            if git merge --no-edit "$PR_HEAD_SHA" -m "Merge PR #$PR_NUM: $PR_TITLE"; then
+              echo "::notice::Successfully merged PR #$PR_NUM: $PR_TITLE"
+              MERGED_PRS="${MERGED_PRS}${PR_NUM},"
+            else
+              echo "::warning::Merge conflict for PR #$PR_NUM, attempting to abort..."
+              git merge --abort || true
+              FAILED_PRS="${FAILED_PRS}${PR_NUM}(conflict),"
+            fi
+          done
+
+          # Remove trailing commas
+          MERGED_PRS=${MERGED_PRS%,}
+          FAILED_PRS=${FAILED_PRS%,}
+
+          echo "merged_prs=$MERGED_PRS" >> $GITHUB_OUTPUT
+          echo "failed_prs=$FAILED_PRS" >> $GITHUB_OUTPUT
+
+          echo ""
+          echo "=========================================="
+          echo "Merge Summary"
+          echo "=========================================="
+          echo "Successfully merged: $MERGED_PRS"
+          echo "Failed to merge: $FAILED_PRS"
+
+          if [ -n "$FAILED_PRS" ]; then
+            echo "::warning::Some PRs failed to merge: $FAILED_PRS"
+          fi
+
+      - name: Generate build metadata
+        id: meta
+        run: |
+          BUILD_DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          BUILD_VERSION=$(date -u +"%Y%m%d")
+
+          echo "build_date=$BUILD_DATE" >> $GITHUB_OUTPUT
+          echo "build_version=$BUILD_VERSION" >> $GITHUB_OUTPUT
+
+          # Create version info file
+          cat > dokploy-source/ENHANCED_VERSION.json << EOF
+          {
+            "build_date": "$BUILD_DATE",
+            "build_version": "$BUILD_VERSION",
+            "upstream_sha": "${{ env.UPSTREAM_SHA }}",
+            "upstream_repo": "${{ env.UPSTREAM_REPO }}",
+            "upstream_branch": "${{ inputs.dokploy_branch || env.UPSTREAM_BRANCH }}",
+            "merged_prs": "${{ steps.merge-prs.outputs.merged_prs || '' }}",
+            "failed_prs": "${{ steps.merge-prs.outputs.failed_prs || '' }}",
+            "repository": "${{ github.repository }}",
+            "run_id": "${{ github.run_id }}"
+          }
+          EOF
+
+          cat dokploy-source/ENHANCED_VERSION.json
+
+      - name: Set up Docker Buildx
+        if: inputs.skip_build != true
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Container Registry
+        if: inputs.skip_build != true
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Docker metadata
+        if: inputs.skip_build != true
+        id: docker-meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest
+            type=raw,value=${{ steps.meta.outputs.build_version }}
+            type=sha,prefix=sha-
+            type=raw,value=canary,enable=${{ inputs.dokploy_branch == 'canary' || env.UPSTREAM_BRANCH == 'canary' }}
+
+      - name: Build and push Docker image
+        if: inputs.skip_build != true
+        uses: docker/build-push-action@v5
+        with:
+          context: ./dokploy-source
+          file: ./dokploy-source/Dockerfile
+          push: true
+          tags: ${{ steps.docker-meta.outputs.tags }}
+          labels: ${{ steps.docker-meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            BUILD_DATE=${{ steps.meta.outputs.build_date }}
+            BUILD_VERSION=${{ steps.meta.outputs.build_version }}
+
+      - name: Generate build summary
+        run: |
+          echo "## Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Configuration" >> $GITHUB_STEP_SUMMARY
+          echo "- **Upstream Repository:** ${{ env.UPSTREAM_REPO }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Upstream Branch:** ${{ inputs.dokploy_branch || env.UPSTREAM_BRANCH }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Upstream SHA:** ${{ env.UPSTREAM_SHA }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### PR Merge Results" >> $GITHUB_STEP_SUMMARY
+          echo "- **Successfully Merged:** ${{ steps.merge-prs.outputs.merged_prs || 'None' }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Failed to Merge:** ${{ steps.merge-prs.outputs.failed_prs || 'None' }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Docker Image" >> $GITHUB_STEP_SUMMARY
+          echo "- **Registry:** ${{ env.REGISTRY }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Image:** ${{ env.IMAGE_NAME }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Build Date:** ${{ steps.meta.outputs.build_date }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Build Version:** ${{ steps.meta.outputs.build_version }}" >> $GITHUB_STEP_SUMMARY
+
+  notify-on-failure:
+    needs: merge-and-build
+    runs-on: ubuntu-latest
+    if: failure()
+    steps:
+      - name: Create failure issue
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const title = `Build Failed: ${new Date().toISOString().split('T')[0]}`;
+            const body = `
+            ## Automated Build Failed
+
+            **Workflow Run:** [#${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+            **Date:** ${new Date().toISOString()}
+
+            Please check the workflow logs for details.
+            `;
+
+            // Check if issue already exists
+            const issues = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: 'build-failure'
+            });
+
+            if (issues.data.length === 0) {
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: title,
+                body: body,
+                labels: ['build-failure', 'automated']
+              });
+            }
