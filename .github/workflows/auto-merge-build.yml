@@ -210,28 +210,25 @@ jobs:
           cd dokploy-source
           # Fix corepack and pnpm issues for reliable builds
           #
-          # Problem: corepack signature validation fails with newer pnpm versions
-          # Problem: corepack@latest or @0.31.0 might default to pnpm 10 which blocks
-          #          native module builds (bcrypt, sharp) due to security features
+          # Problem 1: corepack signature validation fails with newer pnpm versions
           # See: https://github.com/nodejs/corepack/issues/612
+          #
+          # Problem 2: pnpm 10+ blocks native module builds (bcrypt, sharp) by default
           # See: https://github.com/pnpm/pnpm/issues/9042
+          # See: https://pnpm.io/cli/approve-builds
           #
           # Solution:
           # 1. Set COREPACK_INTEGRITY_KEYS="" to bypass signature verification
-          # 2. Keep pnpm 9.x (as specified in Dockerfile) - DO NOT use pnpm 10
+          # 2. Configure pnpm to allow native module builds (bcrypt, sharp, etc.)
           # 3. Use architecture-specific cache for native modules
 
           echo "Original Dockerfile (first 20 lines):"
           head -20 Dockerfile
 
           # 1. Add COREPACK_INTEGRITY_KEYS="" to bypass signature verification
-          #    This allows using pnpm 9.x without signature errors
-          #    Insert after the ENV PATH line in the base stage
           sed -i '/ENV PATH="\$PNPM_HOME:\$PATH"/a ENV COREPACK_INTEGRITY_KEYS=""' Dockerfile
 
           # 2. Fix multi-arch builds: Use TARGETARCH in pnpm cache id
-          # This prevents native modules (bcrypt, sharp, etc.) from different architectures
-          # being mixed in the shared cache, which causes "Cannot find module" errors
           sed -i 's/--mount=type=cache,id=pnpm/--mount=type=cache,id=pnpm-${TARGETARCH}/' Dockerfile
 
           # 3. Add TARGETARCH build arg if not present (needed for cache key)
@@ -239,28 +236,67 @@ jobs:
             sed -i '/FROM .* AS build/a ARG TARGETARCH' Dockerfile
           fi
 
-          # 4. Verify pnpm version is 9.x in the Dockerfile (not 10.x)
+          # 4. Configure pnpm 10+ to allow native module builds
+          # pnpm 10 blocks lifecycle scripts by default for security
+          # We need to allow bcrypt, sharp, and other native modules to build
+          # Option A: Add onlyBuiltDependencies to pnpm-workspace.yaml
+          # Option B: Use --config.onlyBuiltDependencies flag
+          # We'll modify pnpm install commands to allow all builds in Docker context
+          # This is safe since we're building from trusted upstream source
           echo ""
-          echo "Checking pnpm version in Dockerfile..."
-          if grep -q "pnpm@10" Dockerfile; then
-            echo "ERROR: Found pnpm 10 in Dockerfile - this will cause bcrypt build issues!"
-            echo "Downgrading to pnpm 9.12.0..."
-            sed -i 's/pnpm@10[0-9.]*/pnpm@9.12.0/g' Dockerfile
-          fi
+          echo "Configuring pnpm to allow native module builds..."
 
-          # Also check package.json for packageManager field
-          if [ -f "package.json" ]; then
-            echo "Checking package.json for pnpm version..."
-            if grep -q '"pnpm@10' package.json; then
-              echo "WARNING: Found pnpm 10 in package.json packageManager field"
-              echo "Downgrading to pnpm 9.12.0..."
-              sed -i 's/"pnpm@10[0-9.]*"/"pnpm@9.12.0"/g' package.json
+          # Replace 'pnpm install --frozen-lockfile' with version that allows builds
+          sed -i 's/pnpm install --frozen-lockfile/pnpm install --frozen-lockfile --config.confirmModulesPurge=false/g' Dockerfile
+
+          # Create/update pnpm-workspace.yaml to allow native module builds
+          if [ -f "pnpm-workspace.yaml" ]; then
+            echo "Updating pnpm-workspace.yaml..."
+            # Check if onlyBuiltDependencies already exists
+            if ! grep -q "onlyBuiltDependencies" pnpm-workspace.yaml; then
+              cat >> pnpm-workspace.yaml << 'PNPM_CONFIG'
+
+# Allow native module builds (added by dokploy-enhanced)
+# See: https://pnpm.io/settings#onlybuiltdependencies
+onlyBuiltDependencies:
+  - bcrypt
+  - sharp
+  - @node-rs/*
+  - argon2
+  - esbuild
+  - turbo
+  - prisma
+  - '@prisma/client'
+PNPM_CONFIG
             fi
+          else
+            echo "Creating pnpm-workspace.yaml..."
+            cat > pnpm-workspace.yaml << 'PNPM_CONFIG'
+packages:
+  - 'apps/*'
+  - 'packages/*'
+
+# Allow native module builds (added by dokploy-enhanced)
+# See: https://pnpm.io/settings#onlybuiltdependencies
+onlyBuiltDependencies:
+  - bcrypt
+  - sharp
+  - '@node-rs/*'
+  - argon2
+  - esbuild
+  - turbo
+  - prisma
+  - '@prisma/client'
+PNPM_CONFIG
           fi
 
           echo ""
           echo "Patched Dockerfile (first 25 lines):"
           head -25 Dockerfile
+
+          echo ""
+          echo "pnpm-workspace.yaml contents:"
+          cat pnpm-workspace.yaml || echo "No pnpm-workspace.yaml found"
 
           echo ""
           echo "Verifying pnpm version references:"
