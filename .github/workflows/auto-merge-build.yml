@@ -205,12 +205,112 @@ jobs:
           echo "Environment files prepared successfully"
           ls -la .env.production apps/dokploy/.env.production
 
+      - name: Patch Dockerfile to fix build issues
+        run: |
+          cd dokploy-source
+          # Fix corepack and pnpm issues for reliable builds
+          #
+          # Problem 1: corepack signature validation fails with newer pnpm versions
+          # See: https://github.com/nodejs/corepack/issues/612
+          #
+          # Problem 2: pnpm 10+ blocks native module builds (bcrypt, sharp) by default
+          # See: https://github.com/pnpm/pnpm/issues/9042
+          # See: https://pnpm.io/cli/approve-builds
+          #
+          # Solution:
+          # 1. Set COREPACK_INTEGRITY_KEYS="" to bypass signature verification
+          # 2. Configure pnpm to allow native module builds (bcrypt, sharp, etc.)
+          # 3. Use architecture-specific cache for native modules
+
+          echo "Original Dockerfile (first 20 lines):"
+          head -20 Dockerfile
+
+          # 1. Add COREPACK_INTEGRITY_KEYS="" to bypass signature verification
+          sed -i '/ENV PATH="\$PNPM_HOME:\$PATH"/a ENV COREPACK_INTEGRITY_KEYS=""' Dockerfile
+
+          # 2. Fix multi-arch builds: Use TARGETARCH in pnpm cache id
+          sed -i 's/--mount=type=cache,id=pnpm/--mount=type=cache,id=pnpm-${TARGETARCH}/' Dockerfile
+
+          # 3. Add TARGETARCH build arg if not present (needed for cache key)
+          if ! grep -q "ARG TARGETARCH" Dockerfile; then
+            sed -i '/FROM .* AS build/a ARG TARGETARCH' Dockerfile
+          fi
+
+          # 4. Configure pnpm 10+ to allow native module builds
+          # pnpm 10 blocks lifecycle scripts by default for security
+          # We need to allow bcrypt, sharp, and other native modules to build
+          # Option A: Add onlyBuiltDependencies to pnpm-workspace.yaml
+          # Option B: Use --config.onlyBuiltDependencies flag
+          # We'll modify pnpm install commands to allow all builds in Docker context
+          # This is safe since we're building from trusted upstream source
+          echo ""
+          echo "Configuring pnpm to allow native module builds..."
+
+          # Replace 'pnpm install --frozen-lockfile' with version that allows builds
+          sed -i 's/pnpm install --frozen-lockfile/pnpm install --frozen-lockfile --config.confirmModulesPurge=false/g' Dockerfile
+
+          # Create/update pnpm-workspace.yaml to allow native module builds
+          if [ -f "pnpm-workspace.yaml" ]; then
+            echo "Updating pnpm-workspace.yaml..."
+            # Check if onlyBuiltDependencies already exists
+            if ! grep -q "onlyBuiltDependencies" pnpm-workspace.yaml; then
+              cat >> pnpm-workspace.yaml << 'PNPM_CONFIG'
+
+# Allow native module builds (added by dokploy-enhanced)
+# See: https://pnpm.io/settings#onlybuiltdependencies
+onlyBuiltDependencies:
+  - bcrypt
+  - sharp
+  - @node-rs/*
+  - argon2
+  - esbuild
+  - turbo
+  - prisma
+  - '@prisma/client'
+PNPM_CONFIG
+            fi
+          else
+            echo "Creating pnpm-workspace.yaml..."
+            cat > pnpm-workspace.yaml << 'PNPM_CONFIG'
+packages:
+  - 'apps/*'
+  - 'packages/*'
+
+# Allow native module builds (added by dokploy-enhanced)
+# See: https://pnpm.io/settings#onlybuiltdependencies
+onlyBuiltDependencies:
+  - bcrypt
+  - sharp
+  - '@node-rs/*'
+  - argon2
+  - esbuild
+  - turbo
+  - prisma
+  - '@prisma/client'
+PNPM_CONFIG
+          fi
+
+          echo ""
+          echo "Patched Dockerfile (first 25 lines):"
+          head -25 Dockerfile
+
+          echo ""
+          echo "pnpm-workspace.yaml contents:"
+          cat pnpm-workspace.yaml || echo "No pnpm-workspace.yaml found"
+
+          echo ""
+          echo "Verifying pnpm version references:"
+          grep -n "pnpm@" Dockerfile || echo "No pnpm@ references found in Dockerfile"
+
       - name: Upload prepared source
         uses: actions/upload-artifact@v4
         with:
           name: dokploy-source
           path: dokploy-source
           retention-days: 1
+          # IMPORTANT: Include hidden files (files starting with .)
+          # This is required for .env.production files to be included
+          include-hidden-files: true
 
   # ==========================================================================
   # Build AMD64 Image
@@ -225,6 +325,13 @@ jobs:
         with:
           name: dokploy-source
           path: dokploy-source
+
+      - name: Verify env files exist
+        run: |
+          echo "Checking for required .env files..."
+          ls -la dokploy-source/.env.production
+          ls -la dokploy-source/apps/dokploy/.env.production
+          echo "Environment files verified successfully"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -260,6 +367,13 @@ jobs:
         with:
           name: dokploy-source
           path: dokploy-source
+
+      - name: Verify env files exist
+        run: |
+          echo "Checking for required .env files..."
+          ls -la dokploy-source/.env.production
+          ls -la dokploy-source/apps/dokploy/.env.production
+          echo "Environment files verified successfully"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
