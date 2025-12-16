@@ -211,6 +211,9 @@ jobs:
           name: dokploy-source
           path: dokploy-source
           retention-days: 1
+          # IMPORTANT: Include hidden files (files starting with .)
+          # This is required for .env.production files to be included
+          include-hidden-files: true
 
   # ==========================================================================
   # Build AMD64 Image
@@ -225,6 +228,13 @@ jobs:
         with:
           name: dokploy-source
           path: dokploy-source
+
+      - name: Verify env files exist
+        run: |
+          echo "Checking for required .env files..."
+          ls -la dokploy-source/.env.production
+          ls -la dokploy-source/apps/dokploy/.env.production
+          echo "Environment files verified successfully"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -260,6 +270,13 @@ jobs:
         with:
           name: dokploy-source
           path: dokploy-source
+
+      - name: Verify env files exist
+        run: |
+          echo "Checking for required .env files..."
+          ls -la dokploy-source/.env.production
+          ls -la dokploy-source/apps/dokploy/.env.production
+          echo "Environment files verified successfully"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
