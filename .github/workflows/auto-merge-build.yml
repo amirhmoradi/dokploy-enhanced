@@ -34,6 +34,11 @@ env:
   UPSTREAM_REPO: Dokploy/dokploy
   UPSTREAM_BRANCH: canary
 
+# Permissions required for pushing to ghcr.io
+permissions:
+  contents: read
+  packages: write
+
 jobs:
   # ==========================================================================
   # Clone and Merge PRs
