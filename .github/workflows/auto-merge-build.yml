@@ -34,6 +34,11 @@ env:
   UPSTREAM_REPO: Dokploy/dokploy
   UPSTREAM_BRANCH: canary
 
+# Permissions required for pushing to ghcr.io
+permissions:
+  contents: read
+  packages: write
+
 jobs:
   # ==========================================================================
   # Clone and Merge PRs
@@ -249,14 +254,30 @@ jobs:
           # Replace 'pnpm install --frozen-lockfile' with version that allows builds
           sed -i 's/pnpm install --frozen-lockfile/pnpm install --frozen-lockfile --config.confirmModulesPurge=false/g' Dockerfile
 
-          # Create/update pnpm-workspace.yaml to allow native module builds
+          # 5. Fix pnpm v10+ deploy command
+          # pnpm v10 requires inject-workspace-packages=true or --legacy flag
+          # See: https://github.com/orgs/pnpm/discussions/9015
+          # See: https://pnpm.io/cli/deploy
+          echo ""
+          echo "Patching pnpm deploy command for v10+ compatibility..."
+          sed -i 's/pnpm deploy/pnpm deploy --legacy/g' Dockerfile
+          sed -i 's/pnpm --filter=\(.*\) --prod deploy/pnpm --filter=\1 --prod deploy --legacy/g' Dockerfile
+
+          # Create/update pnpm-workspace.yaml to allow native module builds and legacy deploy
           if [ -f "pnpm-workspace.yaml" ]; then
             echo "Updating pnpm-workspace.yaml..."
             # Check if onlyBuiltDependencies already exists
             if ! grep -q "onlyBuiltDependencies" pnpm-workspace.yaml; then
               {
                 echo ''
-                echo '# Allow native module builds (added by dokploy-enhanced)'
+                echo '# Added by dokploy-enhanced for pnpm v10+ compatibility'
+                echo '# See: https://pnpm.io/settings'
+                echo ''
+                echo '# Allow pnpm deploy without inject-workspace-packages'
+                echo '# See: https://pnpm.io/cli/deploy'
+                echo 'forceLegacyDeploy: true'
+                echo ''
+                echo '# Allow native module builds'
                 echo '# See: https://pnpm.io/settings#onlybuiltdependencies'
                 echo 'onlyBuiltDependencies:'
                 echo '  - bcrypt'
@@ -276,7 +297,14 @@ jobs:
               echo "  - 'apps/*'"
               echo "  - 'packages/*'"
               echo ''
-              echo '# Allow native module builds (added by dokploy-enhanced)'
+              echo '# Added by dokploy-enhanced for pnpm v10+ compatibility'
+              echo '# See: https://pnpm.io/settings'
+              echo ''
+              echo '# Allow pnpm deploy without inject-workspace-packages'
+              echo '# See: https://pnpm.io/cli/deploy'
+              echo 'forceLegacyDeploy: true'
+              echo ''
+              echo '# Allow native module builds'
               echo '# See: https://pnpm.io/settings#onlybuiltdependencies'
               echo 'onlyBuiltDependencies:'
               echo '  - bcrypt'
