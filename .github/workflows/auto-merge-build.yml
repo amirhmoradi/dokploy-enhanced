@@ -255,13 +255,12 @@ jobs:
             # Check if onlyBuiltDependencies already exists
             if ! grep -q "onlyBuiltDependencies" pnpm-workspace.yaml; then
               cat >> pnpm-workspace.yaml << 'PNPM_CONFIG'
-
 # Allow native module builds (added by dokploy-enhanced)
 # See: https://pnpm.io/settings#onlybuiltdependencies
 onlyBuiltDependencies:
   - bcrypt
   - sharp
-  - @node-rs/*
+  - '@node-rs/*'
   - argon2
   - esbuild
   - turbo
