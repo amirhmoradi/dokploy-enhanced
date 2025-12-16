@@ -205,6 +205,27 @@ jobs:
           echo "Environment files prepared successfully"
           ls -la .env.production apps/dokploy/.env.production
 
+      - name: Patch Dockerfile to upgrade corepack
+        run: |
+          cd dokploy-source
+          # Fix corepack signature validation issues by upgrading to latest version
+          # See: https://github.com/nodejs/corepack/issues/612
+          # See: https://github.com/pnpm/pnpm/issues/9029
+          #
+          # The bundled corepack in Node images may have outdated signing keys,
+          # causing "Cannot find matching keyid" errors when installing pnpm.
+          # Solution: Upgrade corepack to latest before enabling it.
+
+          echo "Original Dockerfile (first 15 lines):"
+          head -15 Dockerfile
+
+          # Insert 'RUN npm install -g corepack@latest' before 'RUN corepack enable'
+          sed -i 's/RUN corepack enable/RUN npm install -g corepack@latest\nRUN corepack enable/' Dockerfile
+
+          echo ""
+          echo "Patched Dockerfile (first 15 lines):"
+          head -15 Dockerfile
+
       - name: Upload prepared source
         uses: actions/upload-artifact@v4
         with:
