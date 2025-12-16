@@ -208,23 +208,39 @@ jobs:
       - name: Patch Dockerfile to upgrade corepack
         run: |
           cd dokploy-source
-          # Fix corepack signature validation issues by upgrading to latest version
+          # Fix corepack signature validation issues by upgrading to a version with updated keys
           # See: https://github.com/nodejs/corepack/issues/612
           # See: https://github.com/pnpm/pnpm/issues/9029
           #
           # The bundled corepack in Node images may have outdated signing keys,
           # causing "Cannot find matching keyid" errors when installing pnpm.
-          # Solution: Upgrade corepack to latest before enabling it.
+          #
+          # We use corepack@0.31.0 (not @latest) because:
+          # - 0.31.0+ has the updated npm registry signing keys
+          # - @latest might pull incompatible versions that affect pnpm behavior
+          # - This ensures reproducible builds
 
-          echo "Original Dockerfile (first 15 lines):"
-          head -15 Dockerfile
+          echo "Original Dockerfile (first 20 lines):"
+          head -20 Dockerfile
 
-          # Insert 'RUN npm install -g corepack@latest' before 'RUN corepack enable'
-          sed -i 's/RUN corepack enable/RUN npm install -g corepack@latest\nRUN corepack enable/' Dockerfile
+          # 1. Insert corepack upgrade before 'RUN corepack enable'
+          # Using 0.31.0 specifically as it's the minimum version with fixed keys
+          sed -i 's/RUN corepack enable/RUN npm install -g corepack@0.31.0 \&\& corepack enable/' Dockerfile
+
+          # 2. Fix multi-arch builds: Use TARGETARCH in pnpm cache id
+          # This prevents native modules (bcrypt, sharp, etc.) from different architectures
+          # being mixed in the shared cache, which causes "Cannot find module" errors
+          # See: https://github.com/kelektiv/node.bcrypt.js/issues/800
+          sed -i 's/--mount=type=cache,id=pnpm/--mount=type=cache,id=pnpm-${TARGETARCH}/' Dockerfile
+
+          # 3. Add TARGETARCH build arg if not present (needed for cache key)
+          if ! grep -q "ARG TARGETARCH" Dockerfile; then
+            sed -i '/FROM .* AS build/a ARG TARGETARCH' Dockerfile
+          fi
 
           echo ""
-          echo "Patched Dockerfile (first 15 lines):"
-          head -15 Dockerfile
+          echo "Patched Dockerfile (first 25 lines):"
+          head -25 Dockerfile
 
       - name: Upload prepared source
         uses: actions/upload-artifact@v4
