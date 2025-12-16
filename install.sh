@@ -408,27 +408,34 @@ create_dokploy_service() {
     log INFO "Creating Dokploy Enhanced service..."
     log INFO "Using image: $full_image"
 
-    # Build release tag env if not latest
-    local release_tag_env=""
-    if [[ "$version" != "latest" ]]; then
-        release_tag_env="-e RELEASE_TAG=$version"
+    # Build the docker service create command
+    local docker_cmd="docker service create"
+    docker_cmd="$docker_cmd --name $SERVICE_DOKPLOY"
+    docker_cmd="$docker_cmd --replicas 1"
+    docker_cmd="$docker_cmd --network $NETWORK_NAME"
+    docker_cmd="$docker_cmd --mount type=bind,source=/var/run/docker.sock,target=/var/run/docker.sock"
+    docker_cmd="$docker_cmd --mount type=bind,source=$data_dir,target=/etc/dokploy"
+    docker_cmd="$docker_cmd --mount type=volume,source=dokploy,target=/root/.docker"
+    docker_cmd="$docker_cmd --publish published=$port,target=3000,mode=host"
+    docker_cmd="$docker_cmd --update-parallelism 1"
+    docker_cmd="$docker_cmd --update-order stop-first"
+    docker_cmd="$docker_cmd --constraint 'node.role==manager'"
+    docker_cmd="$docker_cmd --env ADVERTISE_ADDR=$advertise_addr"
+
+    # Add endpoint mode if set (for LXC compatibility)
+    if [[ -n "$endpoint_mode" ]]; then
+        docker_cmd="$docker_cmd $endpoint_mode"
     fi
 
-    run_cmd "docker service create \
-        --name $SERVICE_DOKPLOY \
-        --replicas 1 \
-        --network $NETWORK_NAME \
-        --mount type=bind,source=/var/run/docker.sock,target=/var/run/docker.sock \
-        --mount type=bind,source=$data_dir,target=/etc/dokploy \
-        --mount type=volume,source=dokploy,target=/root/.docker \
-        --publish published=$port,target=3000,mode=host \
-        --update-parallelism 1 \
-        --update-order stop-first \
-        --constraint 'node.role==manager' \
-        $endpoint_mode \
-        $release_tag_env \
-        -e ADVERTISE_ADDR=$advertise_addr \
-        $full_image"
+    # Add release tag env if not latest
+    if [[ "$version" != "latest" ]]; then
+        docker_cmd="$docker_cmd --env RELEASE_TAG=$version"
+    fi
+
+    # Add the image at the end
+    docker_cmd="$docker_cmd $full_image"
+
+    run_cmd "$docker_cmd"
 
     log SUCCESS "Dokploy Enhanced service created."
 }
