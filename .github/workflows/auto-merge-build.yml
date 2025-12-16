@@ -35,16 +35,16 @@ env:
   UPSTREAM_BRANCH: canary
 
 jobs:
-  merge-and-build:
+  # ==========================================================================
+  # Clone and Merge PRs
+  # ==========================================================================
+  prepare-source:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
-
     outputs:
       merged_prs: ${{ steps.merge-prs.outputs.merged_prs }}
       failed_prs: ${{ steps.merge-prs.outputs.failed_prs }}
-      build_date: ${{ steps.meta.outputs.build_date }}
+      build_version: ${{ steps.meta.outputs.build_version }}
+      upstream_sha: ${{ steps.clone.outputs.upstream_sha }}
 
     steps:
       - name: Checkout repository
@@ -56,14 +56,16 @@ jobs:
           git config --global user.email "actions@github.com"
 
       - name: Clone upstream Dokploy repository
+        id: clone
         run: |
           BRANCH="${{ inputs.dokploy_branch || env.UPSTREAM_BRANCH }}"
           echo "Cloning upstream Dokploy from branch: $BRANCH"
           git clone --depth=1 --branch "$BRANCH" "https://github.com/${{ env.UPSTREAM_REPO }}.git" dokploy-source
           cd dokploy-source
           git fetch --unshallow || true
-          echo "UPSTREAM_SHA=$(git rev-parse HEAD)" >> $GITHUB_ENV
-          echo "Upstream SHA: $(git rev-parse HEAD)"
+          UPSTREAM_SHA=$(git rev-parse HEAD)
+          echo "upstream_sha=$UPSTREAM_SHA" >> $GITHUB_OUTPUT
+          echo "Upstream SHA: $UPSTREAM_SHA"
 
       - name: Determine PRs to merge
         id: determine-prs
@@ -177,12 +179,12 @@ jobs:
           echo "build_date=$BUILD_DATE" >> $GITHUB_OUTPUT
           echo "build_version=$BUILD_VERSION" >> $GITHUB_OUTPUT
 
-          # Create version info file
+          # Create version info file in the source
           cat > dokploy-source/ENHANCED_VERSION.json << EOF
           {
             "build_date": "$BUILD_DATE",
             "build_version": "$BUILD_VERSION",
-            "upstream_sha": "${{ env.UPSTREAM_SHA }}",
+            "upstream_sha": "${{ steps.clone.outputs.upstream_sha }}",
             "upstream_repo": "${{ env.UPSTREAM_REPO }}",
             "upstream_branch": "${{ inputs.dokploy_branch || env.UPSTREAM_BRANCH }}",
             "merged_prs": "${{ steps.merge-prs.outputs.merged_prs || '' }}",
@@ -194,66 +196,195 @@ jobs:
 
           cat dokploy-source/ENHANCED_VERSION.json
 
+      - name: Prepare env files for build
+        run: |
+          cd dokploy-source
+          # Copy the production env example files (required for build)
+          cp apps/dokploy/.env.production.example .env.production
+          cp apps/dokploy/.env.production.example apps/dokploy/.env.production
+          echo "Environment files prepared successfully"
+          ls -la .env.production apps/dokploy/.env.production
+
+      - name: Upload prepared source
+        uses: actions/upload-artifact@v4
+        with:
+          name: dokploy-source
+          path: dokploy-source
+          retention-days: 1
+
+  # ==========================================================================
+  # Build AMD64 Image
+  # ==========================================================================
+  build-amd64:
+    needs: prepare-source
+    if: ${{ inputs.skip_build != true }}
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Download prepared source
+        uses: actions/download-artifact@v4
+        with:
+          name: dokploy-source
+          path: dokploy-source
+
       - name: Set up Docker Buildx
-        if: inputs.skip_build != true
         uses: docker/setup-buildx-action@v3
 
       - name: Log in to Container Registry
-        if: inputs.skip_build != true
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract Docker metadata
-        if: inputs.skip_build != true
-        id: docker-meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          tags: |
-            type=raw,value=latest
-            type=raw,value=${{ steps.meta.outputs.build_version }}
-            type=sha,prefix=sha-
-            type=raw,value=canary,enable=${{ inputs.dokploy_branch == 'canary' || env.UPSTREAM_BRANCH == 'canary' }}
-
-      - name: Build and push Docker image
-        if: inputs.skip_build != true
+      - name: Build and push AMD64 image
         uses: docker/build-push-action@v5
         with:
           context: ./dokploy-source
           file: ./dokploy-source/Dockerfile
+          platforms: linux/amd64
           push: true
-          tags: ${{ steps.docker-meta.outputs.tags }}
-          labels: ${{ steps.docker-meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-          build-args: |
-            BUILD_DATE=${{ steps.meta.outputs.build_date }}
-            BUILD_VERSION=${{ steps.meta.outputs.build_version }}
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.prepare-source.outputs.build_version }}-amd64
+          cache-from: type=gha,scope=amd64
+          cache-to: type=gha,mode=max,scope=amd64
 
+  # ==========================================================================
+  # Build ARM64 Image
+  # ==========================================================================
+  build-arm64:
+    needs: prepare-source
+    if: ${{ inputs.skip_build != true }}
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - name: Download prepared source
+        uses: actions/download-artifact@v4
+        with:
+          name: dokploy-source
+          path: dokploy-source
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push ARM64 image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./dokploy-source
+          file: ./dokploy-source/Dockerfile
+          platforms: linux/arm64
+          push: true
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.prepare-source.outputs.build_version }}-arm64
+          cache-from: type=gha,scope=arm64
+          cache-to: type=gha,mode=max,scope=arm64
+
+  # ==========================================================================
+  # Create Multi-Arch Manifests
+  # ==========================================================================
+  create-manifests:
+    needs: [prepare-source, build-amd64, build-arm64]
+    if: ${{ inputs.skip_build != true }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create and push multi-arch manifests
+        run: |
+          BUILD_VERSION="${{ needs.prepare-source.outputs.build_version }}"
+          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
+
+          echo "Creating multi-arch manifests for version: $BUILD_VERSION"
+
+          # Create manifest for the dated version
+          docker buildx imagetools create -t ${IMAGE}:${BUILD_VERSION} \
+            ${IMAGE}:${BUILD_VERSION}-amd64 \
+            ${IMAGE}:${BUILD_VERSION}-arm64
+
+          # Create manifest for 'latest'
+          docker buildx imagetools create -t ${IMAGE}:latest \
+            ${IMAGE}:${BUILD_VERSION}-amd64 \
+            ${IMAGE}:${BUILD_VERSION}-arm64
+
+          # Create manifest for 'canary' if building from canary branch
+          BRANCH="${{ inputs.dokploy_branch || env.UPSTREAM_BRANCH }}"
+          if [ "$BRANCH" = "canary" ]; then
+            docker buildx imagetools create -t ${IMAGE}:canary \
+              ${IMAGE}:${BUILD_VERSION}-amd64 \
+              ${IMAGE}:${BUILD_VERSION}-arm64
+          fi
+
+          echo "Manifests created successfully!"
+
+      - name: Verify manifests
+        run: |
+          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
+          echo "Inspecting latest manifest:"
+          docker buildx imagetools inspect ${IMAGE}:latest
+
+  # ==========================================================================
+  # Generate Build Summary
+  # ==========================================================================
+  build-summary:
+    needs: [prepare-source, create-manifests]
+    if: always() && needs.prepare-source.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
       - name: Generate build summary
         run: |
-          echo "## Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "## Dokploy Enhanced Build Summary" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Configuration" >> $GITHUB_STEP_SUMMARY
-          echo "- **Upstream Repository:** ${{ env.UPSTREAM_REPO }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Upstream Branch:** ${{ inputs.dokploy_branch || env.UPSTREAM_BRANCH }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Upstream SHA:** ${{ env.UPSTREAM_SHA }}" >> $GITHUB_STEP_SUMMARY
+          echo "### Source Configuration" >> $GITHUB_STEP_SUMMARY
+          echo "| Setting | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|---------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Upstream Repository | \`${{ env.UPSTREAM_REPO }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Upstream Branch | \`${{ inputs.dokploy_branch || env.UPSTREAM_BRANCH }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Upstream SHA | \`${{ needs.prepare-source.outputs.upstream_sha }}\` |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### PR Merge Results" >> $GITHUB_STEP_SUMMARY
-          echo "- **Successfully Merged:** ${{ steps.merge-prs.outputs.merged_prs || 'None' }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Failed to Merge:** ${{ steps.merge-prs.outputs.failed_prs || 'None' }}" >> $GITHUB_STEP_SUMMARY
+          echo "| Status | PRs |" >> $GITHUB_STEP_SUMMARY
+          echo "|--------|-----|" >> $GITHUB_STEP_SUMMARY
+          echo "| Successfully Merged | ${{ needs.prepare-source.outputs.merged_prs || 'None' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Failed to Merge | ${{ needs.prepare-source.outputs.failed_prs || 'None' }} |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Docker Image" >> $GITHUB_STEP_SUMMARY
-          echo "- **Registry:** ${{ env.REGISTRY }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Image:** ${{ env.IMAGE_NAME }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Build Date:** ${{ steps.meta.outputs.build_date }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Build Version:** ${{ steps.meta.outputs.build_version }}" >> $GITHUB_STEP_SUMMARY
 
+          if [ "${{ inputs.skip_build }}" != "true" ]; then
+            echo "### Docker Images" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "The following tags have been published to \`${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}\`:" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "| Tag | Description |" >> $GITHUB_STEP_SUMMARY
+            echo "|-----|-------------|" >> $GITHUB_STEP_SUMMARY
+            echo "| \`latest\` | Most recent build |" >> $GITHUB_STEP_SUMMARY
+            echo "| \`${{ needs.prepare-source.outputs.build_version }}\` | Date-versioned build |" >> $GITHUB_STEP_SUMMARY
+            echo "| \`canary\` | Canary channel (if applicable) |" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**Pull command:**" >> $GITHUB_STEP_SUMMARY
+            echo "\`\`\`bash" >> $GITHUB_STEP_SUMMARY
+            echo "docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest" >> $GITHUB_STEP_SUMMARY
+            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "### Build Status" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "Docker build was skipped (skip_build=true)" >> $GITHUB_STEP_SUMMARY
+          fi
+
+  # ==========================================================================
+  # Notify on Failure
+  # ==========================================================================
   notify-on-failure:
-    needs: merge-and-build
+    needs: [prepare-source, build-amd64, build-arm64, create-manifests]
     runs-on: ubuntu-latest
     if: failure()
     steps:
@@ -268,10 +399,17 @@ jobs:
             **Workflow Run:** [#${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
             **Date:** ${new Date().toISOString()}
 
+            ### Job Status
+            - prepare-source: ${{ needs.prepare-source.result || 'N/A' }}
+            - build-amd64: ${{ needs.build-amd64.result || 'N/A' }}
+            - build-arm64: ${{ needs.build-arm64.result || 'N/A' }}
+            - create-manifests: ${{ needs.create-manifests.result || 'N/A' }}
+
             Please check the workflow logs for details.
             `;
 
-            // Check if issue already exists
+            // Check if issue already exists today
+            const today = new Date().toISOString().split('T')[0];
             const issues = await github.rest.issues.listForRepo({
               owner: context.repo.owner,
               repo: context.repo.repo,
@@ -279,12 +417,24 @@ jobs:
               labels: 'build-failure'
             });
 
-            if (issues.data.length === 0) {
+            const existingIssue = issues.data.find(issue =>
+              issue.title.includes(today)
+            );
+
+            if (!existingIssue) {
               await github.rest.issues.create({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
                 title: title,
                 body: body,
                 labels: ['build-failure', 'automated']
+              });
+            } else {
+              // Update existing issue with new run info
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: existingIssue.number,
+                body: `Another build failed: [Run #${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})`
               });
             }
