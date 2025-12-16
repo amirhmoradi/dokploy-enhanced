@@ -254,39 +254,40 @@ jobs:
             echo "Updating pnpm-workspace.yaml..."
             # Check if onlyBuiltDependencies already exists
             if ! grep -q "onlyBuiltDependencies" pnpm-workspace.yaml; then
-              cat >> pnpm-workspace.yaml << 'PNPM_CONFIG'
-# Allow native module builds (added by dokploy-enhanced)
-# See: https://pnpm.io/settings#onlybuiltdependencies
-onlyBuiltDependencies:
-  - bcrypt
-  - sharp
-  - '@node-rs/*'
-  - argon2
-  - esbuild
-  - turbo
-  - prisma
-  - '@prisma/client'
-PNPM_CONFIG
+              {
+                echo ''
+                echo '# Allow native module builds (added by dokploy-enhanced)'
+                echo '# See: https://pnpm.io/settings#onlybuiltdependencies'
+                echo 'onlyBuiltDependencies:'
+                echo '  - bcrypt'
+                echo '  - sharp'
+                echo "  - '@node-rs/*'"
+                echo '  - argon2'
+                echo '  - esbuild'
+                echo '  - turbo'
+                echo '  - prisma'
+                echo "  - '@prisma/client'"
+              } >> pnpm-workspace.yaml
             fi
           else
             echo "Creating pnpm-workspace.yaml..."
-            cat > pnpm-workspace.yaml << 'PNPM_CONFIG'
-packages:
-  - 'apps/*'
-  - 'packages/*'
-
-# Allow native module builds (added by dokploy-enhanced)
-# See: https://pnpm.io/settings#onlybuiltdependencies
-onlyBuiltDependencies:
-  - bcrypt
-  - sharp
-  - '@node-rs/*'
-  - argon2
-  - esbuild
-  - turbo
-  - prisma
-  - '@prisma/client'
-PNPM_CONFIG
+            {
+              echo 'packages:'
+              echo "  - 'apps/*'"
+              echo "  - 'packages/*'"
+              echo ''
+              echo '# Allow native module builds (added by dokploy-enhanced)'
+              echo '# See: https://pnpm.io/settings#onlybuiltdependencies'
+              echo 'onlyBuiltDependencies:'
+              echo '  - bcrypt'
+              echo '  - sharp'
+              echo "  - '@node-rs/*'"
+              echo '  - argon2'
+              echo '  - esbuild'
+              echo '  - turbo'
+              echo '  - prisma'
+              echo "  - '@prisma/client'"
+            } > pnpm-workspace.yaml
           fi
 
           echo ""
