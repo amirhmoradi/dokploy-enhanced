@@ -122,7 +122,15 @@ run_cmd() {
         log INFO "[DRY RUN] $cmd"
         return 0
     fi
+    if [[ "${DEBUG:-false}" == "true" ]]; then
+        log DEBUG "Executing command: $cmd"
+    fi
     eval "$cmd"
+    local exit_code=$?
+    if [[ "${DEBUG:-false}" == "true" ]]; then
+        log DEBUG "Command exit code: $exit_code"
+    fi
+    return $exit_code
 }
 
 command_exists() {
@@ -407,35 +415,56 @@ create_dokploy_service() {
 
     log INFO "Creating Dokploy Enhanced service..."
     log INFO "Using image: $full_image"
+    log INFO "Advertise address: $advertise_addr"
+    log INFO "Port: $port"
+    log INFO "Data directory: $data_dir"
 
-    # Build the docker service create command
-    local docker_cmd="docker service create"
-    docker_cmd="$docker_cmd --name $SERVICE_DOKPLOY"
-    docker_cmd="$docker_cmd --replicas 1"
-    docker_cmd="$docker_cmd --network $NETWORK_NAME"
-    docker_cmd="$docker_cmd --mount type=bind,source=/var/run/docker.sock,target=/var/run/docker.sock"
-    docker_cmd="$docker_cmd --mount type=bind,source=$data_dir,target=/etc/dokploy"
-    docker_cmd="$docker_cmd --mount type=volume,source=dokploy,target=/root/.docker"
-    docker_cmd="$docker_cmd --publish published=$port,target=3000,mode=host"
-    docker_cmd="$docker_cmd --update-parallelism 1"
-    docker_cmd="$docker_cmd --update-order stop-first"
-    docker_cmd="$docker_cmd --constraint 'node.role==manager'"
-    docker_cmd="$docker_cmd --env ADVERTISE_ADDR=$advertise_addr"
+    # Build command arguments as an array to handle quoting properly
+    local -a docker_args=(
+        "service" "create"
+        "--name" "$SERVICE_DOKPLOY"
+        "--replicas" "1"
+        "--network" "$NETWORK_NAME"
+        "--mount" "type=bind,source=/var/run/docker.sock,target=/var/run/docker.sock"
+        "--mount" "type=bind,source=$data_dir,target=/etc/dokploy"
+        "--mount" "type=volume,source=dokploy,target=/root/.docker"
+        "--publish" "published=$port,target=3000,mode=host"
+        "--update-parallelism" "1"
+        "--update-order" "stop-first"
+        "--constraint" "node.role==manager"
+        "--env" "ADVERTISE_ADDR=$advertise_addr"
+    )
 
     # Add endpoint mode if set (for LXC compatibility)
     if [[ -n "$endpoint_mode" ]]; then
-        docker_cmd="$docker_cmd $endpoint_mode"
+        # endpoint_mode is like "--endpoint-mode dnsrr", split it
+        docker_args+=($endpoint_mode)
     fi
 
     # Add release tag env if not latest
     if [[ "$version" != "latest" ]]; then
-        docker_cmd="$docker_cmd --env RELEASE_TAG=$version"
+        docker_args+=("--env" "RELEASE_TAG=$version")
     fi
 
     # Add the image at the end
-    docker_cmd="$docker_cmd $full_image"
+    docker_args+=("$full_image")
 
-    run_cmd "$docker_cmd"
+    # Debug output
+    if [[ "${DEBUG:-false}" == "true" ]]; then
+        log DEBUG "Docker command: docker ${docker_args[*]}"
+    fi
+    log INFO "Running: docker ${docker_args[*]}"
+
+    # Execute directly without eval
+    if [[ "${DRY_RUN:-false}" == "true" ]]; then
+        log INFO "[DRY RUN] docker ${docker_args[*]}"
+    else
+        if ! docker "${docker_args[@]}"; then
+            log ERROR "Failed to create Dokploy service"
+            log ERROR "Command was: docker ${docker_args[*]}"
+            return 1
+        fi
+    fi
 
     log SUCCESS "Dokploy Enhanced service created."
 }
