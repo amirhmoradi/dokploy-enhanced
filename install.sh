@@ -719,11 +719,17 @@ stack_deploy() {
         cp "$compose_file" "$rendered_file"
     fi
 
-    # Remove 'profiles' sections as they're not supported by docker stack
-    # Also remove 'container_name' as it's ignored in swarm
+    # Post-process the rendered file for swarm compatibility
     if command_exists sed; then
+        # Remove 'profiles' sections as they're not supported by docker stack
         sed -i '/^\s*profiles:/,/^\s*[^-]/{ /^\s*profiles:/d; /^\s*-/d; }' "$rendered_file" 2>/dev/null || true
+        # Remove 'container_name' as it's ignored in swarm
         sed -i '/^\s*container_name:/d' "$rendered_file" 2>/dev/null || true
+        # Fix port format: convert published: "3000" to published: 3000 (remove quotes around numbers)
+        sed -i 's/published: "\([0-9]*\)"/published: \1/g' "$rendered_file" 2>/dev/null || true
+        # Also fix short-form ports if any: "3000:3000" -> 3000:3000 won't work, need long form
+        # The docker compose config should output long form, but just in case
+        sed -i 's/- "\([0-9]*:[0-9]*\)"/- \1/g' "$rendered_file" 2>/dev/null || true
     fi
 
     # Deploy the stack
