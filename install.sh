@@ -72,13 +72,14 @@ log() {
     local timestamp
     timestamp=$(date '+%Y-%m-%d %H:%M:%S')
 
+    # All log output goes to stderr to avoid interfering with function return values
     case "$level" in
-        INFO)    printf "${BLUE}[INFO]${NC}  %s - %s\n" "$timestamp" "$message" ;;
-        SUCCESS) printf "${GREEN}[OK]${NC}    %s - %s\n" "$timestamp" "$message" ;;
+        INFO)    printf "${BLUE}[INFO]${NC}  %s - %s\n" "$timestamp" "$message" >&2 ;;
+        SUCCESS) printf "${GREEN}[OK]${NC}    %s - %s\n" "$timestamp" "$message" >&2 ;;
         WARN)    printf "${YELLOW}[WARN]${NC}  %s - %s\n" "$timestamp" "$message" >&2 ;;
         ERROR)   printf "${RED}[ERROR]${NC} %s - %s\n" "$timestamp" "$message" >&2 ;;
-        DEBUG)   [[ "${DEBUG:-false}" == "true" ]] && printf "[DEBUG] %s - %s\n" "$timestamp" "$message" ;;
-        *)       printf "%s - %s\n" "$timestamp" "$message" ;;
+        DEBUG)   [[ "${DEBUG:-false}" == "true" ]] && printf "[DEBUG] %s - %s\n" "$timestamp" "$message" >&2 ;;
+        *)       printf "%s - %s\n" "$timestamp" "$message" >&2 ;;
     esac
 }
 
@@ -105,6 +106,62 @@ confirm() {
     fi
 
     [[ "${yn,,}" == "y" || "${yn,,}" == "yes" ]]
+}
+
+# Handle existing file with user prompts
+# Returns: 0 = proceed (overwrite or backup done), 1 = keep existing, 2 = abort
+handle_existing_file() {
+    local file_path="$1"
+    local file_desc="${2:-file}"
+
+    if [[ ! -f "$file_path" ]]; then
+        return 0  # File doesn't exist, proceed with creation
+    fi
+
+    if [[ "${FORCE:-false}" == "true" ]]; then
+        log INFO "Overwriting existing $file_desc (FORCE mode)."
+        return 0
+    fi
+
+    echo "" >&2
+    printf "${YELLOW}Existing $file_desc found:${NC} $file_path\n" >&2
+    echo "" >&2
+    printf "What would you like to do?\n" >&2
+    printf "  ${CYAN}1)${NC} Overwrite - Replace with new configuration\n" >&2
+    printf "  ${CYAN}2)${NC} Backup    - Backup existing and create new\n" >&2
+    printf "  ${CYAN}3)${NC} Keep      - Keep existing file, skip generation\n" >&2
+    printf "  ${CYAN}4)${NC} Abort     - Cancel installation\n" >&2
+    echo "" >&2
+
+    local choice
+    read -rp "Enter choice [1-4]: " choice
+
+    case "$choice" in
+        1|overwrite|o)
+            log INFO "Overwriting existing $file_desc."
+            return 0
+            ;;
+        2|backup|b)
+            local timestamp
+            timestamp=$(date +%Y%m%d_%H%M%S)
+            local backup_path="${file_path}.backup.${timestamp}"
+            cp "$file_path" "$backup_path"
+            log SUCCESS "Backup created: $backup_path"
+            return 0
+            ;;
+        3|keep|k)
+            log INFO "Keeping existing $file_desc."
+            return 1
+            ;;
+        4|abort|a)
+            log INFO "Installation aborted by user."
+            exit 0
+            ;;
+        *)
+            log WARN "Invalid choice. Defaulting to 'keep existing'."
+            return 1
+            ;;
+    esac
 }
 
 command_exists() {
@@ -308,6 +365,12 @@ generate_env_file() {
     local pg_password="$3"
     local env_file="$data_dir/.env"
 
+    # Check for existing file
+    if ! handle_existing_file "$env_file" ".env configuration file"; then
+        log INFO "Using existing .env file."
+        return 0
+    fi
+
     log INFO "Generating .env file..."
 
     cat > "$env_file" << EOF
@@ -350,6 +413,12 @@ EOF
 generate_docker_compose() {
     local data_dir="$1"
     local compose_file="$data_dir/docker-compose.yml"
+
+    # Check for existing file
+    if ! handle_existing_file "$compose_file" "docker-compose.yml"; then
+        log INFO "Using existing docker-compose.yml file."
+        return 0
+    fi
 
     log INFO "Generating docker-compose.yml..."
 
@@ -474,14 +543,20 @@ EOF
 
 generate_traefik_config() {
     local data_dir="$1"
+    local traefik_config="$data_dir/traefik/traefik.yml"
 
     log INFO "Setting up Traefik configuration..."
 
     mkdir -p "$data_dir/traefik/dynamic"
     mkdir -p "$data_dir/traefik/acme"
 
-    if [[ ! -f "$data_dir/traefik/traefik.yml" ]]; then
-        cat > "$data_dir/traefik/traefik.yml" << 'EOF'
+    # Check for existing file
+    if ! handle_existing_file "$traefik_config" "Traefik configuration file"; then
+        log INFO "Using existing Traefik configuration."
+        return 0
+    fi
+
+    cat > "$traefik_config" << 'EOF'
 # =============================================================================
 # Traefik Configuration for Dokploy Enhanced
 # =============================================================================
@@ -525,10 +600,7 @@ log:
 
 accessLog: {}
 EOF
-        log SUCCESS "Traefik configuration created."
-    else
-        log INFO "Traefik configuration already exists."
-    fi
+    log SUCCESS "Traefik configuration created."
 }
 
 # =============================================================================
