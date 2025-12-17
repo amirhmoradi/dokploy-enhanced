@@ -34,7 +34,7 @@ set -euo pipefail
 # Configuration
 # =============================================================================
 
-readonly SCRIPT_VERSION="2.1.0"
+readonly SCRIPT_VERSION="2.2.0"
 readonly SCRIPT_NAME="dokploy-enhanced-installer"
 
 # Default configuration
@@ -690,15 +690,48 @@ stack_deploy() {
     local data_dir="${DOKPLOY_DATA_DIR:-$DEFAULT_DATA_DIR}"
     local env_file="$data_dir/.env"
     local compose_file="$data_dir/docker-compose.yml"
+    local rendered_file="$data_dir/docker-compose.rendered.yml"
 
-    # Source the env file to expand variables
-    set -a
-    # shellcheck source=/dev/null
-    source "$env_file"
-    set +a
+    # Check if compose file exists
+    if [[ ! -f "$compose_file" ]]; then
+        die "docker-compose.yml not found at $compose_file"
+    fi
+
+    # Source the env file to export variables for rendering
+    if [[ -f "$env_file" ]]; then
+        set -a
+        # shellcheck source=/dev/null
+        source "$env_file"
+        set +a
+    fi
+
+    # Render the compose file using docker compose config
+    # This expands all environment variables and validates the file
+    log INFO "Rendering docker-compose.yml for swarm deployment..."
+    if docker compose version &>/dev/null; then
+        docker compose -f "$compose_file" --env-file "$env_file" config > "$rendered_file" 2>/dev/null || {
+            log WARN "Failed to render with docker compose, using original file"
+            cp "$compose_file" "$rendered_file"
+        }
+    else
+        # Fallback: just copy the file and let docker stack handle variable expansion
+        cp "$compose_file" "$rendered_file"
+    fi
+
+    # Remove 'profiles' sections as they're not supported by docker stack
+    # Also remove 'container_name' as it's ignored in swarm
+    if command_exists sed; then
+        sed -i '/^\s*profiles:/,/^\s*[^-]/{ /^\s*profiles:/d; /^\s*-/d; }' "$rendered_file" 2>/dev/null || true
+        sed -i '/^\s*container_name:/d' "$rendered_file" 2>/dev/null || true
+    fi
 
     # Deploy the stack
-    docker stack deploy -c "$compose_file" "$STACK_NAME" --with-registry-auth
+    log INFO "Deploying stack '$STACK_NAME'..."
+    if ! docker stack deploy -c "$rendered_file" "$STACK_NAME" --with-registry-auth; then
+        die "Failed to deploy stack. Check the logs above for details."
+    fi
+
+    log SUCCESS "Stack '$STACK_NAME' deployed successfully."
 }
 
 # Remove the stack (swarm mode)
@@ -725,7 +758,9 @@ services_up() {
     local skip_traefik="${SKIP_TRAEFIK:-false}"
 
     if [[ "$deploy_mode" == "swarm" ]]; then
-        log INFO "Deploying stack to Docker Swarm..."
+        if [[ "$skip_traefik" == "true" ]]; then
+            log WARN "SKIP_TRAEFIK is not fully supported in swarm mode. Traefik will be deployed but can be scaled to 0."
+        fi
         stack_deploy
     else
         log INFO "Starting services with docker-compose..."
@@ -1557,30 +1592,33 @@ EOF
 # =============================================================================
 
 show_main_menu() {
-    echo ""
-    printf "${BOLD}${CYAN}╔════════════════════════════════════════════════════════════╗${NC}\n"
-    printf "${BOLD}${CYAN}║${NC}       ${BOLD}Dokploy Enhanced Installer v${SCRIPT_VERSION}${NC}              ${BOLD}${CYAN}║${NC}\n"
-    printf "${BOLD}${CYAN}╚════════════════════════════════════════════════════════════╝${NC}\n"
-    echo ""
-    printf "${CYAN}What would you like to do?${NC}\n"
-    echo ""
-    printf "  ${GREEN}1)${NC}  Install       - Fresh installation of Dokploy Enhanced\n"
-    printf "  ${GREEN}2)${NC}  Update        - Update to the latest version\n"
-    printf "  ${GREEN}3)${NC}  Start         - Start all services\n"
-    printf "  ${GREEN}4)${NC}  Stop          - Stop all services\n"
-    printf "  ${GREEN}5)${NC}  Restart       - Restart all services\n"
-    printf "  ${GREEN}6)${NC}  Status        - Show current status\n"
-    printf "  ${GREEN}7)${NC}  Logs          - View service logs\n"
-    printf "  ${GREEN}8)${NC}  Backup        - Create a backup\n"
-    printf "  ${GREEN}9)${NC}  Migrate       - Migrate from official Dokploy\n"
-    printf "  ${YELLOW}10)${NC} Uninstall     - Remove Dokploy Enhanced\n"
-    printf "  ${RED}11)${NC} Nuke          - Complete destruction (reset everything)\n"
-    printf "  ${BLUE}12)${NC} Help          - Show detailed help\n"
-    printf "  ${BLUE}0)${NC}  Exit          - Exit without doing anything\n"
-    echo ""
+    # All display output goes to stderr so only the command result goes to stdout
+    {
+        echo ""
+        printf "${BOLD}${CYAN}╔════════════════════════════════════════════════════════════╗${NC}\n"
+        printf "${BOLD}${CYAN}║${NC}       ${BOLD}Dokploy Enhanced Installer v${SCRIPT_VERSION}${NC}              ${BOLD}${CYAN}║${NC}\n"
+        printf "${BOLD}${CYAN}╚════════════════════════════════════════════════════════════╝${NC}\n"
+        echo ""
+        printf "${CYAN}What would you like to do?${NC}\n"
+        echo ""
+        printf "  ${GREEN}1)${NC}  Install       - Fresh installation of Dokploy Enhanced\n"
+        printf "  ${GREEN}2)${NC}  Update        - Update to the latest version\n"
+        printf "  ${GREEN}3)${NC}  Start         - Start all services\n"
+        printf "  ${GREEN}4)${NC}  Stop          - Stop all services\n"
+        printf "  ${GREEN}5)${NC}  Restart       - Restart all services\n"
+        printf "  ${GREEN}6)${NC}  Status        - Show current status\n"
+        printf "  ${GREEN}7)${NC}  Logs          - View service logs\n"
+        printf "  ${GREEN}8)${NC}  Backup        - Create a backup\n"
+        printf "  ${GREEN}9)${NC}  Migrate       - Migrate from official Dokploy\n"
+        printf "  ${YELLOW}10)${NC} Uninstall     - Remove Dokploy Enhanced\n"
+        printf "  ${RED}11)${NC} Nuke          - Complete destruction (reset everything)\n"
+        printf "  ${BLUE}12)${NC} Help          - Show detailed help\n"
+        printf "  ${BLUE}0)${NC}  Exit          - Exit without doing anything\n"
+        echo ""
+        printf "Enter your choice [0-12]: "
+    } >&2
 
     local choice
-    printf "Enter your choice [0-12]: " >&2
     read -r choice < /dev/tty || choice=""
 
     case "$choice" in
