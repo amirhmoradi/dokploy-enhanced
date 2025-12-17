@@ -517,16 +517,45 @@ create_traefik_container() {
 
     log INFO "Creating Traefik container..."
 
-    # Wait for Dokploy to create traefik config
-    local max_wait=30
+    # Create traefik directories if they don't exist
+    mkdir -p "$data_dir/traefik/dynamic"
+
+    # Wait for Dokploy to create traefik config (give it a few seconds)
+    local max_wait=10
     local waited=0
     while [[ ! -f "$data_dir/traefik/traefik.yml" && $waited -lt $max_wait ]]; do
+        log INFO "Waiting for Dokploy to create traefik config... ($waited/$max_wait)"
         sleep 1
         ((waited++))
     done
 
+    # If traefik.yml doesn't exist, create a default one
     if [[ ! -f "$data_dir/traefik/traefik.yml" ]]; then
-        log WARN "Traefik config not found. Dokploy will create it on first start."
+        log INFO "Creating default Traefik configuration..."
+        cat > "$data_dir/traefik/traefik.yml" << 'TRAEFIK_CONFIG'
+api:
+  insecure: true
+  dashboard: true
+
+entryPoints:
+  web:
+    address: ":80"
+  websecure:
+    address: ":443"
+
+providers:
+  docker:
+    endpoint: "unix:///var/run/docker.sock"
+    exposedByDefault: false
+    network: dokploy-network
+  file:
+    directory: "/etc/dokploy/traefik/dynamic"
+    watch: true
+
+log:
+  level: "ERROR"
+TRAEFIK_CONFIG
+        log SUCCESS "Default Traefik configuration created."
     fi
 
     # Remove existing container if any
