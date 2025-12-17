@@ -96,12 +96,15 @@ confirm() {
         return 0
     fi
 
+    # Read from /dev/tty to work when script is piped to bash
     local yn
     if [[ "$default" == "y" ]]; then
-        read -rp "$prompt [Y/n] " yn
+        printf "%s [Y/n] " "$prompt" >&2
+        read -r yn < /dev/tty || yn=""
         yn=${yn:-y}
     else
-        read -rp "$prompt [y/N] " yn
+        printf "%s [y/N] " "$prompt" >&2
+        read -r yn < /dev/tty || yn=""
         yn=${yn:-n}
     fi
 
@@ -133,8 +136,10 @@ handle_existing_file() {
     printf "  ${CYAN}4)${NC} Abort     - Cancel installation\n" >&2
     echo "" >&2
 
+    # Read from /dev/tty to work when script is piped to bash
     local choice
-    read -rp "Enter choice [1-4]: " choice
+    printf "Enter choice [1-4]: " >&2
+    read -r choice < /dev/tty || choice=""
 
     case "$choice" in
         1|overwrite|o)
