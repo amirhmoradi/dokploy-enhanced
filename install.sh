@@ -1556,8 +1556,70 @@ EOF
 # Main Entry Point
 # =============================================================================
 
+show_main_menu() {
+    echo ""
+    printf "${BOLD}${CYAN}╔════════════════════════════════════════════════════════════╗${NC}\n"
+    printf "${BOLD}${CYAN}║${NC}       ${BOLD}Dokploy Enhanced Installer v${SCRIPT_VERSION}${NC}              ${BOLD}${CYAN}║${NC}\n"
+    printf "${BOLD}${CYAN}╚════════════════════════════════════════════════════════════╝${NC}\n"
+    echo ""
+    printf "${CYAN}What would you like to do?${NC}\n"
+    echo ""
+    printf "  ${GREEN}1)${NC}  Install       - Fresh installation of Dokploy Enhanced\n"
+    printf "  ${GREEN}2)${NC}  Update        - Update to the latest version\n"
+    printf "  ${GREEN}3)${NC}  Start         - Start all services\n"
+    printf "  ${GREEN}4)${NC}  Stop          - Stop all services\n"
+    printf "  ${GREEN}5)${NC}  Restart       - Restart all services\n"
+    printf "  ${GREEN}6)${NC}  Status        - Show current status\n"
+    printf "  ${GREEN}7)${NC}  Logs          - View service logs\n"
+    printf "  ${GREEN}8)${NC}  Backup        - Create a backup\n"
+    printf "  ${GREEN}9)${NC}  Migrate       - Migrate from official Dokploy\n"
+    printf "  ${YELLOW}10)${NC} Uninstall     - Remove Dokploy Enhanced\n"
+    printf "  ${RED}11)${NC} Nuke          - Complete destruction (reset everything)\n"
+    printf "  ${BLUE}12)${NC} Help          - Show detailed help\n"
+    printf "  ${BLUE}0)${NC}  Exit          - Exit without doing anything\n"
+    echo ""
+
+    local choice
+    printf "Enter your choice [0-12]: " >&2
+    read -r choice < /dev/tty || choice=""
+
+    case "$choice" in
+        1|install)    echo "install" ;;
+        2|update)     echo "update" ;;
+        3|start)      echo "start" ;;
+        4|stop)       echo "stop" ;;
+        5|restart)    echo "restart" ;;
+        6|status)     echo "status" ;;
+        7|logs)       echo "logs" ;;
+        8|backup)     echo "backup" ;;
+        9|migrate)    echo "migrate" ;;
+        10|uninstall) echo "uninstall" ;;
+        11|nuke)      echo "nuke" ;;
+        12|help)      echo "help" ;;
+        0|exit|q)     echo "exit" ;;
+        *)
+            log ERROR "Invalid choice: $choice"
+            echo "invalid"
+            ;;
+    esac
+}
+
 main() {
-    local command="${1:-install}"
+    local command="${1:-}"
+
+    # If no command provided and not in FORCE mode, show interactive menu
+    if [[ -z "$command" && "${FORCE:-false}" != "true" ]]; then
+        command=$(show_main_menu)
+        if [[ "$command" == "exit" ]]; then
+            log INFO "Exiting. Goodbye!"
+            exit 0
+        elif [[ "$command" == "invalid" ]]; then
+            exit 1
+        fi
+    fi
+
+    # Default to install if still empty (FORCE mode with no args)
+    command="${command:-install}"
 
     case "$command" in
         install)
