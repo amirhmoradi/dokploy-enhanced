@@ -691,14 +691,14 @@ stack_deploy() {
     local data_dir="${DOKPLOY_DATA_DIR:-$DEFAULT_DATA_DIR}"
     local env_file="$data_dir/.env"
     local compose_file="$data_dir/docker-compose.yml"
-    local rendered_file="$data_dir/docker-compose.rendered.yml"
 
     # Check if compose file exists
     if [[ ! -f "$compose_file" ]]; then
         die "docker-compose.yml not found at $compose_file"
     fi
 
-    # Source the env file to export variables for rendering
+    # Source the env file to export variables for docker stack deploy
+    # docker stack deploy handles variable substitution natively
     if [[ -f "$env_file" ]]; then
         set -a
         # shellcheck source=/dev/null
@@ -706,66 +706,11 @@ stack_deploy() {
         set +a
     fi
 
-    # Render the compose file using docker compose config
-    # This expands all environment variables and validates the file
-    log INFO "Rendering docker-compose.yml for swarm deployment..."
-    if docker compose version &>/dev/null; then
-        docker compose -f "$compose_file" --env-file "$env_file" config > "$rendered_file" 2>/dev/null || {
-            log WARN "Failed to render with docker compose, using original file"
-            cp "$compose_file" "$rendered_file"
-        }
-    else
-        # Fallback: just copy the file and let docker stack handle variable expansion
-        cp "$compose_file" "$rendered_file"
-    fi
-
-    # Post-process the rendered file for swarm compatibility
-    if command_exists sed; then
-        # Remove root-level 'name' property - added by docker compose config but not supported by docker stack
-        sed -i '/^name:/d' "$rendered_file" 2>/dev/null || true
-        # Remove 'profiles' sections as they're not supported by docker stack
-        sed -i '/^\s*profiles:/,/^\s*[^-]/{ /^\s*profiles:/d; /^\s*-/d; }' "$rendered_file" 2>/dev/null || true
-        # Remove 'container_name' as it's ignored in swarm
-        sed -i '/^\s*container_name:/d' "$rendered_file" 2>/dev/null || true
-        # Fix port format: convert published: "3000" to published: 3000 (remove quotes around numbers)
-        sed -i 's/published: "\([0-9]*\)"/published: \1/g' "$rendered_file" 2>/dev/null || true
-        # Also fix short-form ports if any
-        sed -i 's/- "\([0-9]*:[0-9]*\)"/- \1/g' "$rendered_file" 2>/dev/null || true
-    fi
-
-    # Remove 'depends_on' sections - not supported in swarm mode (swarm ignores service dependencies
-    # and manages orchestration differently). docker compose config converts simple list format to
-    # long format with conditions, which causes "must be a list" errors with docker stack deploy.
-    if command_exists awk; then
-        awk '
-        /^[[:space:]]*depends_on:[[:space:]]*$/ {
-            # Store the indentation level of depends_on
-            match($0, /^[[:space:]]*/)
-            base_indent = RLENGTH
-            in_depends_on = 1
-            next
-        }
-        in_depends_on {
-            # Check current line indentation
-            if ($0 ~ /^[[:space:]]*$/) next  # Skip empty lines
-            match($0, /^[[:space:]]*/)
-            current_indent = RLENGTH
-            # Exit depends_on block when we hit same or lesser indentation
-            if (current_indent <= base_indent) {
-                in_depends_on = 0
-                print
-                next
-            }
-            # Skip lines that are part of depends_on block
-            next
-        }
-        { print }
-        ' "$rendered_file" > "${rendered_file}.tmp" && mv "${rendered_file}.tmp" "$rendered_file"
-    fi
-
-    # Deploy the stack
+    # Deploy the stack directly using the compose file
+    # docker stack deploy handles env var substitution and ignores unsupported keys
+    # (like depends_on, container_name, profiles) gracefully
     log INFO "Deploying stack '$STACK_NAME'..."
-    if ! docker stack deploy -c "$rendered_file" "$STACK_NAME" --with-registry-auth; then
+    if ! docker stack deploy -c "$compose_file" "$STACK_NAME" --with-registry-auth; then
         die "Failed to deploy stack. Check the logs above for details."
     fi
 
