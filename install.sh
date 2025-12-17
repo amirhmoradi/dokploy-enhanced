@@ -425,8 +425,8 @@ init_swarm() {
         return 0
     fi
 
-    # Leave existing swarm if any
-    docker swarm leave --force 2>/dev/null || true
+    # Leave existing swarm if any (redirect both stdout and stderr)
+    docker swarm leave --force >/dev/null 2>&1 || true
 
     log INFO "Initializing Docker Swarm..."
     # Redirect swarm init output to stderr so it doesn't get captured
@@ -439,6 +439,15 @@ init_swarm() {
 }
 
 create_network() {
+    local deploy_mode="${1:-standalone}"
+
+    # For swarm mode, skip pre-creation - let the stack create the network
+    # This avoids "network already exists" errors during stack deploy
+    if [[ "$deploy_mode" == "swarm" ]]; then
+        log INFO "Skipping network pre-creation for swarm mode (stack will create it)."
+        return 0
+    fi
+
     log INFO "Creating Docker overlay network..."
 
     if docker network ls | grep -q "$NETWORK_NAME"; then
@@ -866,8 +875,8 @@ cmd_install() {
     local advertise_addr
     advertise_addr=$(init_swarm)
 
-    # Create network
-    create_network
+    # Create network (skipped for swarm mode - stack will create it)
+    create_network "$deploy_mode"
 
     # Create data directory
     local data_dir="${DOKPLOY_DATA_DIR:-$DEFAULT_DATA_DIR}"
