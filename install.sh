@@ -34,7 +34,7 @@ set -euo pipefail
 # Configuration
 # =============================================================================
 
-readonly SCRIPT_VERSION="2.0.0"
+readonly SCRIPT_VERSION="2.1.0"
 readonly SCRIPT_NAME="dokploy-enhanced-installer"
 
 # Default configuration
@@ -43,6 +43,8 @@ readonly DEFAULT_IMAGE="dokploy-enhanced"
 readonly DEFAULT_VERSION="latest"
 readonly DEFAULT_PORT="3000"
 readonly DEFAULT_DATA_DIR="/etc/dokploy"
+readonly DEFAULT_DEPLOY_MODE="standalone"  # standalone or swarm
+readonly STACK_NAME="dokploy"
 
 # Docker image versions
 readonly POSTGRES_VERSION="16"
@@ -165,6 +167,49 @@ handle_existing_file() {
         *)
             log WARN "Invalid choice. Defaulting to 'keep existing'."
             return 1
+            ;;
+    esac
+}
+
+# Select deployment mode
+select_deploy_mode() {
+    local mode="${DEPLOY_MODE:-}"
+
+    if [[ -n "$mode" ]]; then
+        if [[ "$mode" != "standalone" && "$mode" != "swarm" ]]; then
+            die "Invalid DEPLOY_MODE: $mode. Must be 'standalone' or 'swarm'."
+        fi
+        echo "$mode"
+        return 0
+    fi
+
+    if [[ "${FORCE:-false}" == "true" ]]; then
+        echo "$DEFAULT_DEPLOY_MODE"
+        return 0
+    fi
+
+    echo "" >&2
+    printf "${CYAN}Select deployment mode:${NC}\n" >&2
+    echo "" >&2
+    printf "  ${CYAN}1)${NC} Standalone - Uses docker-compose (recommended for single node)\n" >&2
+    printf "  ${CYAN}2)${NC} Swarm      - Uses docker stack deploy (for multi-node clusters)\n" >&2
+    echo "" >&2
+
+    local choice
+    printf "Enter choice [1-2] (default: 1): " >&2
+    read -r choice < /dev/tty || choice=""
+    choice=${choice:-1}
+
+    case "$choice" in
+        1|standalone|s)
+            echo "standalone"
+            ;;
+        2|swarm|w)
+            echo "swarm"
+            ;;
+        *)
+            log WARN "Invalid choice. Using standalone mode."
+            echo "standalone"
             ;;
     esac
 }
@@ -368,6 +413,7 @@ generate_env_file() {
     local data_dir="$1"
     local advertise_addr="$2"
     local pg_password="$3"
+    local deploy_mode="$4"
     local env_file="$data_dir/.env"
 
     # Check for existing file
@@ -383,6 +429,9 @@ generate_env_file() {
 # Dokploy Enhanced Configuration
 # Generated on $(date -u +"%Y-%m-%dT%H:%M:%SZ")
 # =============================================================================
+
+# Deployment Mode (standalone or swarm)
+DEPLOY_MODE=${deploy_mode}
 
 # Docker Registry
 DOKPLOY_REGISTRY=${DOKPLOY_REGISTRY:-$DEFAULT_REGISTRY}
@@ -402,9 +451,11 @@ POSTGRES_VERSION=${POSTGRES_VERSION}
 POSTGRES_USER=dokploy
 POSTGRES_DB=dokploy
 POSTGRES_PASSWORD=${pg_password}
+DATABASE_URL=postgresql://dokploy:${pg_password}@postgres:5432/dokploy
 
 # Redis
 REDIS_VERSION=${REDIS_VERSION}
+REDIS_URL=redis://redis:6379
 
 # Traefik
 TRAEFIK_VERSION=${TRAEFIK_VERSION}
@@ -454,6 +505,8 @@ services:
       - dokploy-docker:/root/.docker
     environment:
       - ADVERTISE_ADDR=${ADVERTISE_ADDR}
+      - DATABASE_URL=${DATABASE_URL}
+      - REDIS_URL=${REDIS_URL}
     depends_on:
       - postgres
       - redis
@@ -609,9 +662,22 @@ EOF
 }
 
 # =============================================================================
-# Docker Compose Wrapper
+# Docker Compose/Stack Wrapper
 # =============================================================================
 
+# Get deploy mode from .env file
+get_deploy_mode() {
+    local data_dir="${DOKPLOY_DATA_DIR:-$DEFAULT_DATA_DIR}"
+    local env_file="$data_dir/.env"
+
+    if [[ -f "$env_file" ]]; then
+        grep -E "^DEPLOY_MODE=" "$env_file" 2>/dev/null | cut -d= -f2 || echo "$DEFAULT_DEPLOY_MODE"
+    else
+        echo "$DEFAULT_DEPLOY_MODE"
+    fi
+}
+
+# Wrapper for docker-compose commands (standalone mode)
 compose_cmd() {
     local data_dir="${DOKPLOY_DATA_DIR:-$DEFAULT_DATA_DIR}"
 
@@ -619,6 +685,85 @@ compose_cmd() {
         docker compose -f "$data_dir/docker-compose.yml" --env-file "$data_dir/.env" "$@"
     else
         docker-compose -f "$data_dir/docker-compose.yml" --env-file "$data_dir/.env" "$@"
+    fi
+}
+
+# Deploy using docker stack (swarm mode)
+stack_deploy() {
+    local data_dir="${DOKPLOY_DATA_DIR:-$DEFAULT_DATA_DIR}"
+    local env_file="$data_dir/.env"
+    local compose_file="$data_dir/docker-compose.yml"
+
+    # Source the env file to expand variables
+    set -a
+    # shellcheck source=/dev/null
+    source "$env_file"
+    set +a
+
+    # Deploy the stack
+    docker stack deploy -c "$compose_file" "$STACK_NAME" --with-registry-auth
+}
+
+# Remove the stack (swarm mode)
+stack_remove() {
+    docker stack rm "$STACK_NAME"
+}
+
+# Get stack/compose status based on deploy mode
+services_status() {
+    local deploy_mode
+    deploy_mode=$(get_deploy_mode)
+
+    if [[ "$deploy_mode" == "swarm" ]]; then
+        docker stack services "$STACK_NAME" 2>/dev/null || echo "Stack not deployed"
+    else
+        compose_cmd ps
+    fi
+}
+
+# Start services based on deploy mode
+services_up() {
+    local deploy_mode
+    deploy_mode=$(get_deploy_mode)
+    local skip_traefik="${SKIP_TRAEFIK:-false}"
+
+    if [[ "$deploy_mode" == "swarm" ]]; then
+        log INFO "Deploying stack to Docker Swarm..."
+        stack_deploy
+    else
+        log INFO "Starting services with docker-compose..."
+        if [[ "$skip_traefik" == "true" ]]; then
+            compose_cmd up -d
+        else
+            compose_cmd --profile traefik up -d
+        fi
+    fi
+}
+
+# Stop services based on deploy mode
+services_down() {
+    local deploy_mode
+    deploy_mode=$(get_deploy_mode)
+
+    if [[ "$deploy_mode" == "swarm" ]]; then
+        log INFO "Removing stack from Docker Swarm..."
+        stack_remove
+    else
+        log INFO "Stopping docker-compose services..."
+        compose_cmd --profile traefik down
+    fi
+}
+
+# Stop services without removing (compose only)
+services_stop() {
+    local deploy_mode
+    deploy_mode=$(get_deploy_mode)
+
+    if [[ "$deploy_mode" == "swarm" ]]; then
+        log WARN "Swarm mode does not support stop. Use 'uninstall' to remove the stack."
+        log INFO "To scale down, you can use: docker service scale ${STACK_NAME}_dokploy=0"
+    else
+        compose_cmd stop
     fi
 }
 
@@ -635,11 +780,16 @@ cmd_install() {
     check_os
     check_required_ports
 
+    # Select deployment mode
+    local deploy_mode
+    deploy_mode=$(select_deploy_mode)
+    log INFO "Deployment mode: $deploy_mode"
+
     # Install Docker and Docker Compose
     install_docker
     install_docker_compose
 
-    # Initialize Swarm
+    # Initialize Swarm (required for overlay network, even in standalone mode)
     local advertise_addr
     advertise_addr=$(init_swarm)
 
@@ -656,18 +806,12 @@ cmd_install() {
     local pg_password="${POSTGRES_PASSWORD:-$(generate_password)}"
 
     # Generate configuration files
-    generate_env_file "$data_dir" "$advertise_addr" "$pg_password"
+    generate_env_file "$data_dir" "$advertise_addr" "$pg_password" "$deploy_mode"
     generate_docker_compose "$data_dir"
     generate_traefik_config "$data_dir"
 
-    # Start services
-    log INFO "Starting services with docker-compose..."
-
-    if [[ "${SKIP_TRAEFIK:-false}" == "true" ]]; then
-        compose_cmd up -d
-    else
-        compose_cmd --profile traefik up -d
-    fi
+    # Start services using the appropriate method for deploy mode
+    services_up
 
     # Wait for services to start
     log INFO "Waiting for services to initialize..."
@@ -728,19 +872,27 @@ cmd_update() {
     check_root
 
     local data_dir="${DOKPLOY_DATA_DIR:-$DEFAULT_DATA_DIR}"
+    local deploy_mode
+    deploy_mode=$(get_deploy_mode)
 
     if [[ ! -f "$data_dir/docker-compose.yml" ]]; then
         die "docker-compose.yml not found. Please run install first."
     fi
 
-    log INFO "Pulling latest images..."
-    compose_cmd pull
-
-    log INFO "Recreating containers with new images..."
-    if [[ "${SKIP_TRAEFIK:-false}" == "true" ]]; then
-        compose_cmd up -d
+    if [[ "$deploy_mode" == "swarm" ]]; then
+        log INFO "Updating swarm stack..."
+        # Pull images first
+        docker pull "${DOKPLOY_REGISTRY:-$DEFAULT_REGISTRY}/${DOKPLOY_IMAGE:-$DEFAULT_IMAGE}:${DOKPLOY_VERSION:-$DEFAULT_VERSION}"
+        docker pull "postgres:${POSTGRES_VERSION}"
+        docker pull "redis:${REDIS_VERSION}"
+        docker pull "traefik:${TRAEFIK_VERSION}"
+        # Redeploy stack
+        stack_deploy
     else
-        compose_cmd --profile traefik up -d
+        log INFO "Pulling latest images..."
+        compose_cmd pull
+        log INFO "Recreating containers with new images..."
+        services_up
     fi
 
     log SUCCESS "Dokploy Enhanced updated successfully!"
@@ -750,7 +902,7 @@ cmd_stop() {
     log INFO "Stopping Dokploy Enhanced services..."
     check_root
 
-    compose_cmd stop
+    services_stop
 
     log SUCCESS "Services stopped."
 }
@@ -759,11 +911,7 @@ cmd_start() {
     log INFO "Starting Dokploy Enhanced services..."
     check_root
 
-    if [[ "${SKIP_TRAEFIK:-false}" == "true" ]]; then
-        compose_cmd up -d
-    else
-        compose_cmd --profile traefik up -d
-    fi
+    services_up
 
     log SUCCESS "Services started."
 }
@@ -772,20 +920,33 @@ cmd_restart() {
     log INFO "Restarting Dokploy Enhanced services..."
     check_root
 
-    compose_cmd restart
+    local deploy_mode
+    deploy_mode=$(get_deploy_mode)
+
+    if [[ "$deploy_mode" == "swarm" ]]; then
+        log INFO "Redeploying swarm stack..."
+        stack_deploy
+    else
+        compose_cmd restart
+    fi
 
     log SUCCESS "Services restarted."
 }
 
 cmd_status() {
     local data_dir="${DOKPLOY_DATA_DIR:-$DEFAULT_DATA_DIR}"
+    local deploy_mode
+    deploy_mode=$(get_deploy_mode)
 
     echo ""
     printf "${CYAN}=== Dokploy Enhanced Status ===${NC}\n"
     echo ""
 
+    printf "${BOLD}Deploy Mode:${NC} $deploy_mode\n"
+    echo ""
+
     printf "${BOLD}Services:${NC}\n"
-    compose_cmd ps
+    services_status
     echo ""
 
     printf "${BOLD}Docker Swarm:${NC}\n"
@@ -802,7 +963,7 @@ cmd_status() {
 
     if [[ -f "$data_dir/.env" ]]; then
         printf "${BOLD}Configuration (.env):${NC}\n"
-        grep -v "PASSWORD" "$data_dir/.env" | grep -v "^#" | grep -v "^$" | head -20
+        grep -v "PASSWORD" "$data_dir/.env" | grep -v "DATABASE_URL" | grep -v "^#" | grep -v "^$" | head -20
         echo ""
     fi
 
@@ -816,18 +977,44 @@ cmd_status() {
 cmd_logs() {
     local service="${1:-}"
     local follow="${2:-}"
+    local deploy_mode
+    deploy_mode=$(get_deploy_mode)
 
-    if [[ -n "$service" && "$service" != "-f" ]]; then
-        if [[ "$follow" == "-f" ]]; then
-            compose_cmd logs -f "$service"
+    if [[ "$deploy_mode" == "swarm" ]]; then
+        # Swarm mode: use docker service logs
+        if [[ -n "$service" && "$service" != "-f" ]]; then
+            local svc_name="${STACK_NAME}_${service}"
+            if [[ "$follow" == "-f" ]]; then
+                docker service logs -f "$svc_name" 2>/dev/null || docker service logs -f "$service"
+            else
+                docker service logs --tail 100 "$svc_name" 2>/dev/null || docker service logs --tail 100 "$service"
+            fi
         else
-            compose_cmd logs --tail 100 "$service"
+            # Show all stack services logs
+            log INFO "Showing logs for all stack services..."
+            if [[ "$service" == "-f" || "$follow" == "-f" ]]; then
+                docker service logs -f "${STACK_NAME}_dokploy"
+            else
+                for svc in dokploy postgres redis; do
+                    printf "\n${CYAN}=== ${svc} ===${NC}\n"
+                    docker service logs --tail 50 "${STACK_NAME}_${svc}" 2>/dev/null || true
+                done
+            fi
         fi
     else
-        if [[ "$service" == "-f" || "$follow" == "-f" ]]; then
-            compose_cmd logs -f
+        # Standalone mode: use docker-compose logs
+        if [[ -n "$service" && "$service" != "-f" ]]; then
+            if [[ "$follow" == "-f" ]]; then
+                compose_cmd logs -f "$service"
+            else
+                compose_cmd logs --tail 100 "$service"
+            fi
         else
-            compose_cmd logs --tail 100
+            if [[ "$service" == "-f" || "$follow" == "-f" ]]; then
+                compose_cmd logs -f
+            else
+                compose_cmd logs --tail 100
+            fi
         fi
     fi
 }
@@ -843,13 +1030,22 @@ cmd_uninstall() {
     check_root
 
     local data_dir="${DOKPLOY_DATA_DIR:-$DEFAULT_DATA_DIR}"
+    local deploy_mode
+    deploy_mode=$(get_deploy_mode)
 
-    log INFO "Stopping and removing containers..."
-    compose_cmd --profile traefik down 2>/dev/null || true
+    log INFO "Stopping and removing services..."
+    if [[ "$deploy_mode" == "swarm" ]]; then
+        docker stack rm "$STACK_NAME" 2>/dev/null || true
+        sleep 5
+    else
+        compose_cmd --profile traefik down 2>/dev/null || true
+    fi
 
     if confirm "Remove Docker volumes (this will delete all data)?"; then
         log INFO "Removing Docker volumes..."
-        compose_cmd --profile traefik down -v 2>/dev/null || true
+        if [[ "$deploy_mode" != "swarm" ]]; then
+            compose_cmd --profile traefik down -v 2>/dev/null || true
+        fi
         docker volume rm dokploy-docker dokploy-postgres dokploy-redis 2>/dev/null || true
     fi
 
@@ -867,6 +1063,92 @@ cmd_uninstall() {
     fi
 
     log SUCCESS "Dokploy Enhanced has been uninstalled."
+}
+
+cmd_nuke() {
+    log WARN "============================================"
+    log WARN "  NUCLEAR OPTION - COMPLETE DESTRUCTION    "
+    log WARN "============================================"
+    log WARN ""
+    log WARN "This will COMPLETELY REMOVE:"
+    log WARN "  - All Dokploy containers and services"
+    log WARN "  - All Docker volumes (PostgreSQL, Redis data)"
+    log WARN "  - The dokploy-network"
+    log WARN "  - Leave Docker Swarm"
+    log WARN "  - Delete /etc/dokploy directory"
+    log WARN "  - All backups in /var/backups/dokploy"
+    log WARN ""
+    log WARN "This action is IRREVERSIBLE!"
+    log WARN ""
+
+    if ! confirm "Type 'y' to confirm COMPLETE DESTRUCTION"; then
+        log INFO "Nuke cancelled. Your data is safe."
+        exit 0
+    fi
+
+    # Double confirm for safety
+    echo "" >&2
+    printf "${RED}Are you ABSOLUTELY SURE? This cannot be undone!${NC}\n" >&2
+    printf "Type 'NUKE' to confirm: " >&2
+    local confirmation
+    read -r confirmation < /dev/tty || confirmation=""
+
+    if [[ "$confirmation" != "NUKE" ]]; then
+        log INFO "Nuke cancelled. Your data is safe."
+        exit 0
+    fi
+
+    check_root
+
+    local data_dir="${DOKPLOY_DATA_DIR:-$DEFAULT_DATA_DIR}"
+
+    log INFO "Starting nuclear cleanup..."
+
+    # Stop and remove swarm stack
+    log INFO "Removing Docker stack..."
+    docker stack rm "$STACK_NAME" 2>/dev/null || true
+    sleep 3
+
+    # Stop and remove compose services
+    log INFO "Removing docker-compose services..."
+    compose_cmd --profile traefik down -v 2>/dev/null || true
+
+    # Remove any remaining dokploy containers
+    log INFO "Removing any remaining containers..."
+    docker ps -a --filter "name=dokploy" -q | xargs -r docker rm -f 2>/dev/null || true
+
+    # Remove Docker swarm services
+    log INFO "Removing Docker swarm services..."
+    docker service rm dokploy dokploy-postgres dokploy-redis 2>/dev/null || true
+
+    # Remove all dokploy volumes
+    log INFO "Removing Docker volumes..."
+    docker volume rm dokploy-docker dokploy-postgres dokploy-redis 2>/dev/null || true
+    docker volume ls --filter "name=dokploy" -q | xargs -r docker volume rm 2>/dev/null || true
+
+    # Remove network
+    log INFO "Removing Docker network..."
+    docker network rm "$NETWORK_NAME" 2>/dev/null || true
+
+    # Leave swarm
+    log INFO "Leaving Docker Swarm..."
+    docker swarm leave --force 2>/dev/null || true
+
+    # Remove data directory
+    log INFO "Removing data directory..."
+    rm -rf "$data_dir"
+
+    # Remove backups
+    log INFO "Removing backups..."
+    rm -rf /var/backups/dokploy
+
+    echo ""
+    printf "${GREEN}============================================${NC}\n"
+    printf "${GREEN}  Nuclear cleanup complete!                 ${NC}\n"
+    printf "${GREEN}============================================${NC}\n"
+    echo ""
+    log SUCCESS "All Dokploy Enhanced data has been removed."
+    log INFO "You can now run 'install' for a fresh start."
 }
 
 cmd_backup() {
@@ -932,9 +1214,15 @@ ${CYAN}Commands:${NC}
     backup      Create a backup of all data
     migrate     Migrate from official Dokploy to Dokploy Enhanced
     uninstall   Remove Dokploy Enhanced and optionally all data
+    nuke        Complete destruction - remove everything and start fresh
     help        Show this help message
 
+${CYAN}Deployment Modes:${NC}
+    standalone  Uses docker-compose (recommended for single node)
+    swarm       Uses docker stack deploy (for multi-node clusters)
+
 ${CYAN}Environment Variables:${NC}
+    DEPLOY_MODE              Deployment mode: standalone or swarm (default: standalone)
     DOKPLOY_VERSION          Docker image tag (default: latest)
     DOKPLOY_PORT             Web interface port (default: 3000)
     DOKPLOY_REGISTRY         Docker registry (default: ghcr.io/amirhmoradi)
@@ -944,8 +1232,7 @@ ${CYAN}Environment Variables:${NC}
     SKIP_DOCKER_INSTALL      Skip Docker installation (true/false)
     SKIP_TRAEFIK             Skip Traefik installation (true/false)
     POSTGRES_PASSWORD        Custom PostgreSQL password
-    DRY_RUN                  Show commands without executing (true/false)
-    FORCE                    Force installation even with warnings (true/false)
+    FORCE                    Skip all prompts, use defaults (true/false)
     DEBUG                    Enable debug output (true/false)
 
 ${CYAN}Configuration Files:${NC}
@@ -955,8 +1242,14 @@ ${CYAN}Configuration Files:${NC}
     - ${DEFAULT_DATA_DIR}/traefik/          - Traefik configuration
 
 ${CYAN}Examples:${NC}
-    # Basic installation
+    # Basic installation (interactive mode selection)
     curl -sSL <url> | bash
+
+    # Install with swarm mode
+    DEPLOY_MODE=swarm curl -sSL <url> | bash
+
+    # Install with standalone mode (no prompts)
+    FORCE=true DEPLOY_MODE=standalone curl -sSL <url> | bash
 
     # Install specific version
     DOKPLOY_VERSION=20241216 curl -sSL <url> | bash
@@ -973,8 +1266,8 @@ ${CYAN}Examples:${NC}
     # View logs
     $0 logs -f
 
-    # Show status
-    $0 status
+    # Complete reset (nuclear option)
+    $0 nuke
 
 ${CYAN}More Information:${NC}
     GitHub: https://github.com/amirhmoradi/dokploy-enhanced
@@ -1173,18 +1466,14 @@ EOF
     # Override port and password for generate functions
     DOKPLOY_PORT="$port"
 
-    generate_env_file "$data_dir" "$advertise_addr" "$pg_password"
+    # Migration uses standalone mode by default (can be changed after migration)
+    local deploy_mode="${DEPLOY_MODE:-standalone}"
+    generate_env_file "$data_dir" "$advertise_addr" "$pg_password" "$deploy_mode"
     generate_docker_compose "$data_dir"
     generate_traefik_config "$data_dir"
 
-    # Start services with docker-compose
-    log INFO "Starting services with docker-compose..."
-
-    if [[ "${SKIP_TRAEFIK:-false}" == "true" ]]; then
-        compose_cmd up -d
-    else
-        compose_cmd --profile traefik up -d
-    fi
+    # Start services
+    services_up
 
     # Wait for services to start
     log INFO "Waiting for services to initialize..."
@@ -1304,6 +1593,9 @@ main() {
             ;;
         uninstall|remove)
             cmd_uninstall
+            ;;
+        nuke)
+            cmd_nuke
             ;;
         help|--help|-h)
             cmd_help
