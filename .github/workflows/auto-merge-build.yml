@@ -288,6 +288,7 @@ jobs:
                 echo '  - turbo'
                 echo '  - prisma'
                 echo "  - '@prisma/client'"
+                echo '  - node-pty'
               } >> pnpm-workspace.yaml
             fi
           else
@@ -315,6 +316,7 @@ jobs:
               echo '  - turbo'
               echo '  - prisma'
               echo "  - '@prisma/client'"
+              echo '  - node-pty'
             } > pnpm-workspace.yaml
           fi
 
