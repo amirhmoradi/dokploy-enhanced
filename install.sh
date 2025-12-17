@@ -727,9 +727,38 @@ stack_deploy() {
         sed -i '/^\s*container_name:/d' "$rendered_file" 2>/dev/null || true
         # Fix port format: convert published: "3000" to published: 3000 (remove quotes around numbers)
         sed -i 's/published: "\([0-9]*\)"/published: \1/g' "$rendered_file" 2>/dev/null || true
-        # Also fix short-form ports if any: "3000:3000" -> 3000:3000 won't work, need long form
-        # The docker compose config should output long form, but just in case
+        # Also fix short-form ports if any
         sed -i 's/- "\([0-9]*:[0-9]*\)"/- \1/g' "$rendered_file" 2>/dev/null || true
+    fi
+
+    # Remove 'depends_on' sections - not supported in swarm mode (swarm ignores service dependencies
+    # and manages orchestration differently). docker compose config converts simple list format to
+    # long format with conditions, which causes "must be a list" errors with docker stack deploy.
+    if command_exists awk; then
+        awk '
+        /^[[:space:]]*depends_on:[[:space:]]*$/ {
+            # Store the indentation level of depends_on
+            match($0, /^[[:space:]]*/)
+            base_indent = RLENGTH
+            in_depends_on = 1
+            next
+        }
+        in_depends_on {
+            # Check current line indentation
+            if ($0 ~ /^[[:space:]]*$/) next  # Skip empty lines
+            match($0, /^[[:space:]]*/)
+            current_indent = RLENGTH
+            # Exit depends_on block when we hit same or lesser indentation
+            if (current_indent <= base_indent) {
+                in_depends_on = 0
+                print
+                next
+            }
+            # Skip lines that are part of depends_on block
+            next
+        }
+        { print }
+        ' "$rendered_file" > "${rendered_file}.tmp" && mv "${rendered_file}.tmp" "$rendered_file"
     fi
 
     # Deploy the stack
