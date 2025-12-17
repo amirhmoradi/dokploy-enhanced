@@ -517,19 +517,11 @@ create_traefik_container() {
 
     log INFO "Creating Traefik container..."
 
-    # Create traefik directories if they don't exist
+    # Create traefik directories
+    log INFO "Setting up Traefik directories..."
     mkdir -p "$data_dir/traefik/dynamic"
 
-    # Wait for Dokploy to create traefik config (give it a few seconds)
-    local max_wait=10
-    local waited=0
-    while [[ ! -f "$data_dir/traefik/traefik.yml" && $waited -lt $max_wait ]]; do
-        log INFO "Waiting for Dokploy to create traefik config... ($waited/$max_wait)"
-        sleep 1
-        waited=$((waited + 1))
-    done
-
-    # If traefik.yml doesn't exist, create a default one
+    # Create traefik.yml if it doesn't exist
     if [[ ! -f "$data_dir/traefik/traefik.yml" ]]; then
         log INFO "Creating default Traefik configuration..."
         cat > "$data_dir/traefik/traefik.yml" << 'TRAEFIK_CONFIG'
