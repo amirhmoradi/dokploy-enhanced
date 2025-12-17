@@ -721,6 +721,8 @@ stack_deploy() {
 
     # Post-process the rendered file for swarm compatibility
     if command_exists sed; then
+        # Remove root-level 'name' property - added by docker compose config but not supported by docker stack
+        sed -i '/^name:/d' "$rendered_file" 2>/dev/null || true
         # Remove 'profiles' sections as they're not supported by docker stack
         sed -i '/^\s*profiles:/,/^\s*[^-]/{ /^\s*profiles:/d; /^\s*-/d; }' "$rendered_file" 2>/dev/null || true
         # Remove 'container_name' as it's ignored in swarm
