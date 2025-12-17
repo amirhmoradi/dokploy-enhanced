@@ -385,7 +385,8 @@ init_swarm() {
     docker swarm leave --force 2>/dev/null || true
 
     log INFO "Initializing Docker Swarm..."
-    if ! docker swarm init --advertise-addr "$advertise_addr"; then
+    # Redirect swarm init output to stderr so it doesn't get captured
+    if ! docker swarm init --advertise-addr "$advertise_addr" >&2; then
         die "Failed to initialize Docker Swarm."
     fi
 
