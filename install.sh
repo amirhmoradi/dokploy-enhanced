@@ -526,7 +526,7 @@ create_traefik_container() {
     while [[ ! -f "$data_dir/traefik/traefik.yml" && $waited -lt $max_wait ]]; do
         log INFO "Waiting for Dokploy to create traefik config... ($waited/$max_wait)"
         sleep 1
-        ((waited++))
+        waited=$((waited + 1))
     done
 
     # If traefik.yml doesn't exist, create a default one
