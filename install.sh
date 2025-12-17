@@ -371,16 +371,35 @@ create_postgres_service() {
 
     log INFO "Creating PostgreSQL service..."
 
-    run_cmd "docker service create \
-        --name $SERVICE_POSTGRES \
-        --constraint 'node.role==manager' \
-        --network $NETWORK_NAME \
-        --env POSTGRES_USER=dokploy \
-        --env POSTGRES_DB=dokploy \
-        --env POSTGRES_PASSWORD=$password \
-        --mount type=volume,source=dokploy-postgres,target=/var/lib/postgresql/data \
-        $endpoint_mode \
-        postgres:$POSTGRES_VERSION"
+    # Build command arguments as an array
+    local -a docker_args=(
+        "service" "create"
+        "--name" "$SERVICE_POSTGRES"
+        "--constraint" "node.role==manager"
+        "--network" "$NETWORK_NAME"
+        "--env" "POSTGRES_USER=dokploy"
+        "--env" "POSTGRES_DB=dokploy"
+        "--env" "POSTGRES_PASSWORD=$password"
+        "--mount" "type=volume,source=dokploy-postgres,target=/var/lib/postgresql/data"
+    )
+
+    # Add endpoint mode if set (for LXC compatibility)
+    if [[ -n "$endpoint_mode" ]]; then
+        docker_args+=($endpoint_mode)
+    fi
+
+    docker_args+=("postgres:$POSTGRES_VERSION")
+
+    log INFO "Running: docker ${docker_args[*]}"
+
+    if [[ "${DRY_RUN:-false}" == "true" ]]; then
+        log INFO "[DRY RUN] docker ${docker_args[*]}"
+    else
+        if ! docker "${docker_args[@]}"; then
+            log ERROR "Failed to create PostgreSQL service"
+            return 1
+        fi
+    fi
 
     log SUCCESS "PostgreSQL service created."
     echo "$password"
@@ -391,13 +410,32 @@ create_redis_service() {
 
     log INFO "Creating Redis service..."
 
-    run_cmd "docker service create \
-        --name $SERVICE_REDIS \
-        --constraint 'node.role==manager' \
-        --network $NETWORK_NAME \
-        --mount type=volume,source=dokploy-redis,target=/data \
-        $endpoint_mode \
-        redis:$REDIS_VERSION"
+    # Build command arguments as an array
+    local -a docker_args=(
+        "service" "create"
+        "--name" "$SERVICE_REDIS"
+        "--constraint" "node.role==manager"
+        "--network" "$NETWORK_NAME"
+        "--mount" "type=volume,source=dokploy-redis,target=/data"
+    )
+
+    # Add endpoint mode if set (for LXC compatibility)
+    if [[ -n "$endpoint_mode" ]]; then
+        docker_args+=($endpoint_mode)
+    fi
+
+    docker_args+=("redis:$REDIS_VERSION")
+
+    log INFO "Running: docker ${docker_args[*]}"
+
+    if [[ "${DRY_RUN:-false}" == "true" ]]; then
+        log INFO "[DRY RUN] docker ${docker_args[*]}"
+    else
+        if ! docker "${docker_args[@]}"; then
+            log ERROR "Failed to create Redis service"
+            return 1
+        fi
+    fi
 
     log SUCCESS "Redis service created."
 }
@@ -494,19 +532,35 @@ create_traefik_container() {
     # Remove existing container if any
     docker rm -f "$CONTAINER_TRAEFIK" 2>/dev/null || true
 
-    run_cmd "docker run -d \
-        --name $CONTAINER_TRAEFIK \
-        --restart always \
-        -v $data_dir/traefik/traefik.yml:/etc/traefik/traefik.yml \
-        -v $data_dir/traefik/dynamic:/etc/dokploy/traefik/dynamic \
-        -v /var/run/docker.sock:/var/run/docker.sock:ro \
-        -p 80:80/tcp \
-        -p 443:443/tcp \
-        -p 443:443/udp \
-        traefik:$TRAEFIK_VERSION"
+    # Build docker run command as array
+    local -a docker_args=(
+        "run" "-d"
+        "--name" "$CONTAINER_TRAEFIK"
+        "--restart" "always"
+        "-v" "$data_dir/traefik/traefik.yml:/etc/traefik/traefik.yml"
+        "-v" "$data_dir/traefik/dynamic:/etc/dokploy/traefik/dynamic"
+        "-v" "/var/run/docker.sock:/var/run/docker.sock:ro"
+        "-p" "80:80/tcp"
+        "-p" "443:443/tcp"
+        "-p" "443:443/udp"
+        "traefik:$TRAEFIK_VERSION"
+    )
+
+    log INFO "Running: docker ${docker_args[*]}"
+
+    if [[ "${DRY_RUN:-false}" == "true" ]]; then
+        log INFO "[DRY RUN] docker ${docker_args[*]}"
+    else
+        if ! docker "${docker_args[@]}"; then
+            log ERROR "Failed to create Traefik container"
+            log ERROR "Command was: docker ${docker_args[*]}"
+            return 1
+        fi
+    fi
 
     # Connect Traefik to the network
-    run_cmd "docker network connect $NETWORK_NAME $CONTAINER_TRAEFIK" || true
+    log INFO "Connecting Traefik to network $NETWORK_NAME..."
+    docker network connect "$NETWORK_NAME" "$CONTAINER_TRAEFIK" 2>/dev/null || true
 
     log SUCCESS "Traefik container created."
 }
