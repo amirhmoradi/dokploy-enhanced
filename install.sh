@@ -853,6 +853,7 @@ ${CYAN}Commands:${NC}
     status      Show current status of all services
     logs        Show service logs (use -f to follow)
     backup      Create a backup of all data
+    migrate     Migrate from official Dokploy to Dokploy Enhanced
     uninstall   Remove Dokploy Enhanced and optionally all data
     help        Show this help message
 
@@ -886,6 +887,9 @@ ${CYAN}Examples:${NC}
     # Install with custom port
     DOKPLOY_PORT=8080 curl -sSL <url> | bash
 
+    # Migrate from official Dokploy
+    $0 migrate
+
     # Update to latest
     $0 update
 
@@ -900,6 +904,289 @@ ${CYAN}More Information:${NC}
     Docs:   https://github.com/amirhmoradi/dokploy-enhanced#readme
 
 EOF
+}
+
+# =============================================================================
+# Migration from Official Dokploy
+# =============================================================================
+
+detect_official_dokploy() {
+    # Check if official Dokploy Docker Swarm services exist
+    if docker service ls 2>/dev/null | grep -q "dokploy"; then
+        return 0
+    fi
+    return 1
+}
+
+get_service_env() {
+    local service_name="$1"
+    local env_name="$2"
+    docker service inspect "$service_name" 2>/dev/null | \
+        grep -oP "(?<=\"${env_name}=)[^\"]*" | head -1
+}
+
+get_postgres_password_from_service() {
+    # Try to get password from dokploy-postgres service
+    local password
+    password=$(docker service inspect dokploy-postgres 2>/dev/null | \
+        grep -oP '(?<="POSTGRES_PASSWORD=)[^"]*' | head -1)
+
+    if [[ -z "$password" ]]; then
+        # Try to get from dokploy service DATABASE_URL
+        local db_url
+        db_url=$(docker service inspect dokploy 2>/dev/null | \
+            grep -oP '(?<="DATABASE_URL=)[^"]*' | head -1)
+        if [[ -n "$db_url" ]]; then
+            # Extract password from postgresql://user:password@host/db
+            password=$(echo "$db_url" | grep -oP '(?<=:)[^:@]+(?=@)')
+        fi
+    fi
+
+    echo "$password"
+}
+
+get_advertise_addr_from_swarm() {
+    docker info 2>/dev/null | grep -oP '(?<=Advertise Address: )[^\s]+' | head -1
+}
+
+cmd_migrate() {
+    log INFO "Starting migration from official Dokploy to Dokploy Enhanced..."
+    log INFO "Script version: $SCRIPT_VERSION"
+
+    check_root
+
+    # Check if official Dokploy is installed
+    if ! detect_official_dokploy; then
+        log ERROR "No official Dokploy installation detected."
+        log INFO "This command migrates an existing official Dokploy installation"
+        log INFO "to the Dokploy Enhanced docker-compose based setup."
+        log INFO ""
+        log INFO "If you want a fresh install, use: $0 install"
+        exit 1
+    fi
+
+    log SUCCESS "Official Dokploy installation detected."
+
+    # Show current state
+    echo ""
+    printf "${CYAN}Current Docker Swarm Services:${NC}\n"
+    docker service ls 2>/dev/null | grep -E "dokploy|REPLICAS"
+    echo ""
+
+    printf "${CYAN}Current Docker Containers:${NC}\n"
+    docker ps --filter "name=dokploy" --format "table {{.Names}}\t{{.Image}}\t{{.Status}}" 2>/dev/null
+    echo ""
+
+    printf "${CYAN}Current Docker Volumes:${NC}\n"
+    docker volume ls --filter "name=dokploy" 2>/dev/null
+    echo ""
+
+    # Confirm migration
+    log WARN "This will migrate your official Dokploy installation to Dokploy Enhanced."
+    log WARN "The migration will:"
+    log WARN "  1. Extract configuration from existing services"
+    log WARN "  2. Create a backup of current state"
+    log WARN "  3. Stop and remove Docker Swarm services"
+    log WARN "  4. Generate docker-compose.yml and .env files"
+    log WARN "  5. Start services using docker-compose"
+    log WARN ""
+    log WARN "Your data (PostgreSQL, Redis, /etc/dokploy) will be PRESERVED."
+    echo ""
+
+    if ! confirm "Do you want to proceed with the migration?"; then
+        log INFO "Migration cancelled."
+        exit 0
+    fi
+
+    local data_dir="${DOKPLOY_DATA_DIR:-$DEFAULT_DATA_DIR}"
+
+    # Extract configuration from existing installation
+    log INFO "Extracting configuration from existing installation..."
+
+    # Get advertise address
+    local advertise_addr
+    advertise_addr=$(get_advertise_addr_from_swarm)
+    if [[ -z "$advertise_addr" ]]; then
+        advertise_addr=$(get_private_ip)
+    fi
+    log INFO "Advertise address: $advertise_addr"
+
+    # Get PostgreSQL password
+    local pg_password
+    pg_password=$(get_postgres_password_from_service)
+    if [[ -z "$pg_password" ]]; then
+        log WARN "Could not extract PostgreSQL password from existing service."
+        log WARN "A new password will be generated. You may need to reset the database."
+        pg_password=$(generate_password)
+    else
+        log SUCCESS "PostgreSQL password extracted from existing service."
+    fi
+
+    # Get port from existing service
+    local port="${DOKPLOY_PORT:-$DEFAULT_PORT}"
+    local existing_port
+    existing_port=$(docker service inspect dokploy 2>/dev/null | \
+        grep -oP '(?<="PublishedPort":)\d+' | head -1)
+    if [[ -n "$existing_port" ]]; then
+        port="$existing_port"
+        log INFO "Using existing port: $port"
+    fi
+
+    # Create backup before migration
+    log INFO "Creating backup before migration..."
+    local backup_dir="/var/backups/dokploy"
+    local timestamp
+    timestamp=$(date +%Y%m%d_%H%M%S)
+    local backup_path="$backup_dir/pre_migration_$timestamp"
+    mkdir -p "$backup_path"
+
+    # Backup configuration
+    if [[ -d "$data_dir" ]]; then
+        cp -r "$data_dir" "$backup_path/config" 2>/dev/null || true
+    fi
+
+    # Save service configurations
+    docker service inspect dokploy > "$backup_path/dokploy-service.json" 2>/dev/null || true
+    docker service inspect dokploy-postgres > "$backup_path/dokploy-postgres-service.json" 2>/dev/null || true
+    docker service inspect dokploy-redis > "$backup_path/dokploy-redis-service.json" 2>/dev/null || true
+
+    # Save current state
+    cat > "$backup_path/migration-info.json" << EOF
+{
+    "migrated_at": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
+    "from": "official-dokploy",
+    "to": "dokploy-enhanced",
+    "script_version": "$SCRIPT_VERSION",
+    "advertise_addr": "$advertise_addr",
+    "port": "$port"
+}
+EOF
+
+    log SUCCESS "Backup created at: $backup_path"
+
+    # Stop and remove old services
+    log INFO "Stopping Docker Swarm services..."
+
+    # Stop dokploy service first (depends on postgres and redis)
+    docker service rm dokploy 2>/dev/null || true
+    sleep 2
+
+    # Stop postgres and redis
+    docker service rm dokploy-postgres 2>/dev/null || true
+    docker service rm dokploy-redis 2>/dev/null || true
+
+    # Stop traefik container
+    docker rm -f dokploy-traefik 2>/dev/null || true
+
+    log SUCCESS "Old services stopped."
+
+    # Ensure network exists (don't remove it, just make sure it's there)
+    log INFO "Ensuring network exists..."
+    if ! docker network ls | grep -q "$NETWORK_NAME"; then
+        docker network create --driver overlay --attachable "$NETWORK_NAME"
+    fi
+
+    # Ensure data directory exists
+    mkdir -p "$data_dir"
+    chmod 755 "$data_dir"
+
+    # Generate new configuration files
+    log INFO "Generating docker-compose configuration..."
+
+    # Override port and password for generate functions
+    DOKPLOY_PORT="$port"
+
+    generate_env_file "$data_dir" "$advertise_addr" "$pg_password"
+    generate_docker_compose "$data_dir"
+    generate_traefik_config "$data_dir"
+
+    # Start services with docker-compose
+    log INFO "Starting services with docker-compose..."
+
+    if [[ "${SKIP_TRAEFIK:-false}" == "true" ]]; then
+        compose_cmd up -d
+    else
+        compose_cmd --profile traefik up -d
+    fi
+
+    # Wait for services to start
+    log INFO "Waiting for services to initialize..."
+    sleep 10
+
+    # Verify migration
+    log INFO "Verifying migration..."
+    local success=true
+
+    if ! docker ps | grep -q "dokploy"; then
+        log ERROR "Dokploy container is not running!"
+        success=false
+    fi
+
+    if ! docker ps | grep -q "dokploy-postgres"; then
+        log ERROR "PostgreSQL container is not running!"
+        success=false
+    fi
+
+    if ! docker ps | grep -q "dokploy-redis"; then
+        log ERROR "Redis container is not running!"
+        success=false
+    fi
+
+    if [[ "$success" == "true" ]]; then
+        # Save installation info
+        cat > "$data_dir/install-info.json" << EOF
+{
+    "installed_at": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
+    "migrated_from": "official-dokploy",
+    "script_version": "$SCRIPT_VERSION",
+    "docker_version": "$(docker --version 2>/dev/null)",
+    "advertise_addr": "$advertise_addr",
+    "port": "$port",
+    "registry": "${DOKPLOY_REGISTRY:-$DEFAULT_REGISTRY}",
+    "image": "${DOKPLOY_IMAGE:-$DEFAULT_IMAGE}",
+    "version": "${DOKPLOY_VERSION:-$DEFAULT_VERSION}"
+}
+EOF
+
+        local public_ip
+        public_ip="${ADVERTISE_ADDR:-$(get_public_ip)}" || public_ip="$advertise_addr"
+        local formatted_addr
+        formatted_addr=$(format_ip_for_url "$public_ip")
+
+        echo ""
+        printf "${GREEN}============================================${NC}\n"
+        printf "${GREEN}  Migration Completed Successfully!         ${NC}\n"
+        printf "${GREEN}============================================${NC}\n"
+        echo ""
+        printf "${CYAN}Access your Dokploy instance at:${NC}\n"
+        printf "${YELLOW}  http://${formatted_addr}:${port}${NC}\n"
+        echo ""
+        printf "${CYAN}Your data has been preserved:${NC}\n"
+        printf "  - PostgreSQL data (dokploy-postgres volume)\n"
+        printf "  - Redis data (dokploy-redis volume)\n"
+        printf "  - Configuration (/etc/dokploy)\n"
+        echo ""
+        printf "${CYAN}Configuration files:${NC}\n"
+        printf "  .env file:           ${YELLOW}${data_dir}/.env${NC}\n"
+        printf "  docker-compose.yml:  ${YELLOW}${data_dir}/docker-compose.yml${NC}\n"
+        echo ""
+        printf "${CYAN}Pre-migration backup:${NC}\n"
+        printf "  ${YELLOW}${backup_path}${NC}\n"
+        echo ""
+        printf "${CYAN}Useful commands:${NC}\n"
+        printf "  View status:    ${YELLOW}$0 status${NC}\n"
+        printf "  View logs:      ${YELLOW}$0 logs -f${NC}\n"
+        printf "  Restart:        ${YELLOW}$0 restart${NC}\n"
+        echo ""
+
+        log SUCCESS "Migration completed successfully!"
+    else
+        log ERROR "Migration verification failed!"
+        log ERROR "Check the logs with: $0 logs"
+        log INFO "Pre-migration backup is available at: $backup_path"
+        log INFO "You may need to restore from backup or troubleshoot manually."
+        exit 1
+    fi
 }
 
 # =============================================================================
@@ -934,6 +1221,9 @@ main() {
             ;;
         backup)
             cmd_backup
+            ;;
+        migrate)
+            cmd_migrate
             ;;
         uninstall|remove)
             cmd_uninstall

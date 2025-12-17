@@ -19,6 +19,7 @@
   - [Environment Variables](#environment-variables)
 - [Configuration Files](#configuration-files)
 - [Commands Reference](#commands-reference)
+- [Migration from Official Dokploy](#migration-from-official-dokploy)
 - [Docker Compose](#docker-compose)
 - [GitHub Actions Workflow](#github-actions-workflow)
   - [Configuring PR Merges](#configuring-pr-merges)
@@ -306,6 +307,12 @@ Show current status of all services:
 ./install.sh backup
 ```
 
+### Migrate
+Migrate from official Dokploy to Dokploy Enhanced:
+```bash
+./install.sh migrate
+```
+
 ### Uninstall
 ```bash
 ./install.sh uninstall
@@ -315,6 +322,76 @@ Show current status of all services:
 ```bash
 ./install.sh help
 ```
+
+## Migration from Official Dokploy
+
+If you have an existing installation from the [official Dokploy](https://dokploy.com) install script, you can migrate to Dokploy Enhanced while preserving all your data.
+
+### What Gets Migrated
+
+The migration process preserves:
+- **PostgreSQL database** (all your projects, users, settings)
+- **Redis data** (sessions, cache)
+- **Configuration files** (`/etc/dokploy`)
+- **Docker volumes** (`dokploy-postgres`, `dokploy-redis`)
+
+### Migration Process
+
+1. **Run the migrate command:**
+   ```bash
+   curl -sSL https://raw.githubusercontent.com/amirhmoradi/dokploy-enhanced/main/install.sh -o install.sh
+   chmod +x install.sh
+   ./install.sh migrate
+   ```
+
+2. **The migration will:**
+   - Detect your existing Dokploy installation
+   - Extract configuration (port, PostgreSQL password, etc.)
+   - Create a backup of current state
+   - Stop Docker Swarm services
+   - Generate new docker-compose.yml and .env files
+   - Start services using docker-compose
+   - Verify the migration was successful
+
+3. **After migration, you'll have:**
+   - Editable `.env` file for configuration
+   - `docker-compose.yml` for full stack visibility
+   - Standard docker-compose commands
+   - Enhanced Dokploy image with merged community PRs
+
+### Pre-Migration Checklist
+
+Before migrating, ensure:
+- [ ] You have root access
+- [ ] You have a recent backup (migration creates one automatically)
+- [ ] Your Dokploy services are running (`docker service ls`)
+- [ ] You can access your current Dokploy instance
+
+### Rollback
+
+If migration fails, you can restore from the pre-migration backup:
+
+```bash
+# Backup location is shown during migration, e.g.:
+# /var/backups/dokploy/pre_migration_20241217_120000
+
+# Stop new services
+./install.sh stop
+
+# Restore old services manually using the backup JSON files
+# Or contact support for assistance
+```
+
+### Differences After Migration
+
+| Aspect | Official Dokploy | Dokploy Enhanced |
+|--------|------------------|------------------|
+| Service Management | Docker Swarm services | docker-compose |
+| Configuration | Environment variables at runtime | `.env` file |
+| Stack Visibility | `docker service ls` | `docker-compose.yml` |
+| Image Source | `dokploy/dokploy` | `ghcr.io/amirhmoradi/dokploy-enhanced` |
+| Updates | Re-run official install | `./install.sh update` |
+| Community PRs | Not included | Automatically merged |
 
 ## Docker Compose
 
