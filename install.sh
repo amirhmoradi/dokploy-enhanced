@@ -560,8 +560,6 @@ services:
     image: traefik:${TRAEFIK_VERSION}
     container_name: dokploy-traefik
     restart: unless-stopped
-    profiles:
-      - traefik
     networks:
       - dokploy-network
     ports:
@@ -738,20 +736,12 @@ services_status() {
 services_up() {
     local deploy_mode
     deploy_mode=$(get_deploy_mode)
-    local skip_traefik="${SKIP_TRAEFIK:-false}"
 
     if [[ "$deploy_mode" == "swarm" ]]; then
-        if [[ "$skip_traefik" == "true" ]]; then
-            log WARN "SKIP_TRAEFIK is not fully supported in swarm mode. Traefik will be deployed but can be scaled to 0."
-        fi
         stack_deploy
     else
         log INFO "Starting services with docker-compose..."
-        if [[ "$skip_traefik" == "true" ]]; then
-            compose_cmd up -d
-        else
-            compose_cmd --profile traefik up -d
-        fi
+        compose_cmd up -d
     fi
 }
 
@@ -765,7 +755,7 @@ services_down() {
         stack_remove
     else
         log INFO "Stopping docker-compose services..."
-        compose_cmd --profile traefik down
+        compose_cmd down
     fi
 }
 
@@ -1053,13 +1043,13 @@ cmd_uninstall() {
         docker stack rm "$STACK_NAME" 2>/dev/null || true
         sleep 5
     else
-        compose_cmd --profile traefik down 2>/dev/null || true
+        compose_cmd down 2>/dev/null || true
     fi
 
     if confirm "Remove Docker volumes (this will delete all data)?"; then
         log INFO "Removing Docker volumes..."
         if [[ "$deploy_mode" != "swarm" ]]; then
-            compose_cmd --profile traefik down -v 2>/dev/null || true
+            compose_cmd down -v 2>/dev/null || true
         fi
         docker volume rm dokploy-docker dokploy-postgres dokploy-redis 2>/dev/null || true
     fi
@@ -1126,7 +1116,7 @@ cmd_nuke() {
 
     # Stop and remove compose services
     log INFO "Removing docker-compose services..."
-    compose_cmd --profile traefik down -v 2>/dev/null || true
+    compose_cmd down -v 2>/dev/null || true
 
     # Remove any remaining dokploy containers
     log INFO "Removing any remaining containers..."
