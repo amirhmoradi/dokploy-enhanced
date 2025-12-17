@@ -4,15 +4,16 @@
 # https://github.com/amirhmoradi/dokploy-enhanced
 #
 # This script provides a robust, configurable installation for Dokploy Enhanced,
-# an enhanced version of Dokploy with additional features and custom PR merges.
+# using docker-compose for better visibility and easier maintenance.
 #
 # Usage:
 #   curl -sSL https://raw.githubusercontent.com/amirhmoradi/dokploy-enhanced/main/install.sh | bash
 #   curl -sSL https://raw.githubusercontent.com/amirhmoradi/dokploy-enhanced/main/install.sh | bash -s -- install
 #   curl -sSL https://raw.githubusercontent.com/amirhmoradi/dokploy-enhanced/main/install.sh | bash -s -- update
-#   curl -sSL https://raw.githubusercontent.com/amirhmoradi/dokploy-enhanced/main/install.sh | bash -s -- uninstall
+#   curl -sSL https://raw.githubusercontent.com/amirhmoradi/dokploy-enhanced/main/install.sh | bash -s -- stop
+#   curl -sSL https://raw.githubusercontent.com/amirhmoradi/dokploy-enhanced/main/install.sh | bash -s -- start
 #   curl -sSL https://raw.githubusercontent.com/amirhmoradi/dokploy-enhanced/main/install.sh | bash -s -- status
-#   curl -sSL https://raw.githubusercontent.com/amirhmoradi/dokploy-enhanced/main/install.sh | bash -s -- backup
+#   curl -sSL https://raw.githubusercontent.com/amirhmoradi/dokploy-enhanced/main/install.sh | bash -s -- uninstall
 #
 # Environment Variables:
 #   DOKPLOY_VERSION      - Docker image tag (default: latest)
@@ -20,13 +21,11 @@
 #   DOKPLOY_REGISTRY     - Docker registry (default: ghcr.io/amirhmoradi)
 #   DOKPLOY_IMAGE        - Docker image name (default: dokploy-enhanced)
 #   ADVERTISE_ADDR       - Docker Swarm advertise address
-#   DOCKER_SWARM_INIT_ARGS - Additional Docker Swarm init arguments
 #   SKIP_DOCKER_INSTALL  - Skip Docker installation if set to "true"
 #   SKIP_TRAEFIK         - Skip Traefik installation if set to "true"
 #   POSTGRES_PASSWORD    - Custom PostgreSQL password
 #   DRY_RUN              - Show commands without executing if set to "true"
 #   FORCE                - Force installation even with warnings
-#   BACKUP_DIR           - Directory for backups (default: /var/backups/dokploy)
 #
 
 set -euo pipefail
@@ -35,7 +34,7 @@ set -euo pipefail
 # Configuration
 # =============================================================================
 
-readonly SCRIPT_VERSION="1.0.0"
+readonly SCRIPT_VERSION="2.0.0"
 readonly SCRIPT_NAME="dokploy-enhanced-installer"
 
 # Default configuration
@@ -43,23 +42,15 @@ readonly DEFAULT_REGISTRY="ghcr.io/amirhmoradi"
 readonly DEFAULT_IMAGE="dokploy-enhanced"
 readonly DEFAULT_VERSION="latest"
 readonly DEFAULT_PORT="3000"
-readonly DEFAULT_BACKUP_DIR="/var/backups/dokploy"
 readonly DEFAULT_DATA_DIR="/etc/dokploy"
 
-# Docker versions
-readonly DOCKER_VERSION="28.5.0"
+# Docker image versions
 readonly POSTGRES_VERSION="16"
 readonly REDIS_VERSION="7"
-readonly TRAEFIK_VERSION="v3.6.1"
+readonly TRAEFIK_VERSION="v3.1.6"
 
 # Network configuration
 readonly NETWORK_NAME="dokploy-network"
-
-# Service names
-readonly SERVICE_DOKPLOY="dokploy"
-readonly SERVICE_POSTGRES="dokploy-postgres"
-readonly SERVICE_REDIS="dokploy-redis"
-readonly CONTAINER_TRAEFIK="dokploy-traefik"
 
 # Colors for output
 readonly RED='\033[0;31m'
@@ -116,15 +107,6 @@ confirm() {
     [[ "${yn,,}" == "y" || "${yn,,}" == "yes" ]]
 }
 
-run_cmd() {
-    local cmd="$*"
-    if [[ "${DRY_RUN:-false}" == "true" ]]; then
-        log INFO "[DRY RUN] $cmd"
-        return 0
-    fi
-    eval "$cmd"
-}
-
 command_exists() {
     command -v "$1" >/dev/null 2>&1
 }
@@ -145,51 +127,14 @@ check_os() {
     fi
 }
 
-spinner() {
-    local pid=$1
-    local delay=0.1
-    local spinstr='|/-\'
-    while ps -p "$pid" > /dev/null 2>&1; do
-        local temp=${spinstr#?}
-        printf " [%c]  " "$spinstr"
-        spinstr=$temp${spinstr%"$temp"}
-        sleep $delay
-        printf "\b\b\b\b\b\b"
-    done
-    printf "      \b\b\b\b\b\b"
+generate_password() {
+    local length="${1:-32}"
+    tr -dc 'a-zA-Z0-9' < /dev/urandom | fold -w "$length" | head -n 1
 }
 
 # =============================================================================
 # Environment Detection
 # =============================================================================
-
-is_proxmox_lxc() {
-    # Check for LXC in environment
-    if [[ -n "${container:-}" && "$container" == "lxc" ]]; then
-        return 0
-    fi
-
-    # Check for LXC in /proc/1/environ
-    if grep -q "container=lxc" /proc/1/environ 2>/dev/null; then
-        return 0
-    fi
-
-    return 1
-}
-
-is_wsl() {
-    grep -qEi "(microsoft|wsl)" /proc/version 2>/dev/null
-}
-
-get_distro() {
-    if [[ -f /etc/os-release ]]; then
-        # shellcheck source=/dev/null
-        . /etc/os-release
-        echo "${ID:-unknown}"
-    else
-        echo "unknown"
-    fi
-}
 
 get_public_ip() {
     local ip=""
@@ -200,19 +145,9 @@ get_public_ip() {
         "https://api.ipify.org"
     )
 
-    # Try IPv4 first
     for service in "${services[@]}"; do
         ip=$(curl -4s --connect-timeout 5 "$service" 2>/dev/null | tr -d '[:space:]')
         if [[ -n "$ip" && "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "$ip"
-            return 0
-        fi
-    done
-
-    # Fall back to IPv6
-    for service in "${services[@]}"; do
-        ip=$(curl -6s --connect-timeout 5 "$service" 2>/dev/null | tr -d '[:space:]')
-        if [[ -n "$ip" ]]; then
             echo "$ip"
             return 0
         fi
@@ -244,8 +179,6 @@ format_ip_for_url() {
 
 check_port() {
     local port="$1"
-    local service_name="${2:-service}"
-
     if ss -tulnp 2>/dev/null | grep -q ":${port} "; then
         return 1
     fi
@@ -259,30 +192,30 @@ check_required_ports() {
     log INFO "Checking required ports..."
 
     if ! check_port 80 "HTTP"; then
-        log ERROR "Port 80 is already in use. Required for Traefik HTTP."
-        ((errors++))
+        log WARN "Port 80 is already in use. Traefik HTTP may not work."
+        errors=$((errors + 1))
     fi
 
     if ! check_port 443 "HTTPS"; then
-        log ERROR "Port 443 is already in use. Required for Traefik HTTPS."
-        ((errors++))
+        log WARN "Port 443 is already in use. Traefik HTTPS may not work."
+        errors=$((errors + 1))
     fi
 
     if ! check_port "$port" "Dokploy"; then
         log ERROR "Port $port is already in use. Required for Dokploy web interface."
-        ((errors++))
+        errors=$((errors + 1))
     fi
 
     if [[ $errors -gt 0 ]]; then
-        log ERROR "Please stop the services using these ports and try again."
-        log INFO "You can use 'ss -tulnp | grep :<port>' to identify the services."
+        log WARN "Some ports are in use. You can use 'ss -tulnp | grep :<port>' to identify services."
         if [[ "${FORCE:-false}" != "true" ]]; then
-            exit 1
+            if ! confirm "Continue anyway?"; then
+                exit 1
+            fi
         fi
-        log WARN "Continuing due to FORCE=true..."
+    else
+        log SUCCESS "All required ports are available."
     fi
-
-    log SUCCESS "All required ports are available."
 }
 
 # =============================================================================
@@ -302,8 +235,25 @@ install_docker() {
     fi
 
     log INFO "Installing Docker..."
-    run_cmd "curl -sSL https://get.docker.com | sh -s -- --version $DOCKER_VERSION"
+    curl -sSL https://get.docker.com | sh
     log SUCCESS "Docker installed successfully."
+}
+
+install_docker_compose() {
+    if command_exists docker-compose || docker compose version &>/dev/null; then
+        log INFO "Docker Compose already available."
+        return 0
+    fi
+
+    log INFO "Installing Docker Compose plugin..."
+    apt-get update -qq && apt-get install -y -qq docker-compose-plugin 2>/dev/null || {
+        # Fallback: install standalone docker-compose
+        log INFO "Installing standalone Docker Compose..."
+        curl -SL "https://github.com/docker/compose/releases/latest/download/docker-compose-$(uname -s)-$(uname -m)" \
+            -o /usr/local/bin/docker-compose
+        chmod +x /usr/local/bin/docker-compose
+    }
+    log SUCCESS "Docker Compose installed successfully."
 }
 
 init_swarm() {
@@ -312,25 +262,23 @@ init_swarm() {
     if [[ -z "$advertise_addr" ]]; then
         log ERROR "Could not determine private IP address."
         log INFO "Please set the ADVERTISE_ADDR environment variable."
-        log INFO "Example: export ADVERTISE_ADDR=192.168.1.100"
         exit 1
     fi
 
     log INFO "Using advertise address: $advertise_addr"
 
+    # Check if already in swarm
+    if docker info 2>/dev/null | grep -q "Swarm: active"; then
+        log INFO "Docker Swarm already initialized."
+        echo "$advertise_addr"
+        return 0
+    fi
+
     # Leave existing swarm if any
     docker swarm leave --force 2>/dev/null || true
 
-    # Build swarm init command
-    local swarm_args="--advertise-addr $advertise_addr"
-
-    if [[ -n "${DOCKER_SWARM_INIT_ARGS:-}" ]]; then
-        log INFO "Using custom swarm init arguments: $DOCKER_SWARM_INIT_ARGS"
-        swarm_args="$swarm_args $DOCKER_SWARM_INIT_ARGS"
-    fi
-
     log INFO "Initializing Docker Swarm..."
-    if ! run_cmd "docker swarm init $swarm_args"; then
+    if ! docker swarm init --advertise-addr "$advertise_addr"; then
         die "Failed to initialize Docker Swarm."
     fi
 
@@ -341,145 +289,260 @@ init_swarm() {
 create_network() {
     log INFO "Creating Docker overlay network..."
 
-    # Remove existing network if any
-    docker network rm -f "$NETWORK_NAME" 2>/dev/null || true
+    if docker network ls | grep -q "$NETWORK_NAME"; then
+        log INFO "Network '$NETWORK_NAME' already exists."
+        return 0
+    fi
 
-    run_cmd "docker network create --driver overlay --attachable $NETWORK_NAME"
+    docker network create --driver overlay --attachable "$NETWORK_NAME"
     log SUCCESS "Network '$NETWORK_NAME' created successfully."
 }
 
 # =============================================================================
-# Service Functions
+# Docker Compose File Generation
 # =============================================================================
 
-generate_password() {
-    local length="${1:-32}"
-    tr -dc 'a-zA-Z0-9' < /dev/urandom | fold -w "$length" | head -n 1
+generate_env_file() {
+    local data_dir="$1"
+    local advertise_addr="$2"
+    local pg_password="$3"
+    local env_file="$data_dir/.env"
+
+    log INFO "Generating .env file..."
+
+    cat > "$env_file" << EOF
+# =============================================================================
+# Dokploy Enhanced Configuration
+# Generated on $(date -u +"%Y-%m-%dT%H:%M:%SZ")
+# =============================================================================
+
+# Docker Registry
+DOKPLOY_REGISTRY=${DOKPLOY_REGISTRY:-$DEFAULT_REGISTRY}
+DOKPLOY_IMAGE=${DOKPLOY_IMAGE:-$DEFAULT_IMAGE}
+DOKPLOY_VERSION=${DOKPLOY_VERSION:-$DEFAULT_VERSION}
+
+# Network
+ADVERTISE_ADDR=${advertise_addr}
+DOKPLOY_PORT=${DOKPLOY_PORT:-$DEFAULT_PORT}
+NETWORK_NAME=${NETWORK_NAME}
+
+# Data Directory
+DATA_DIR=${data_dir}
+
+# PostgreSQL
+POSTGRES_VERSION=${POSTGRES_VERSION}
+POSTGRES_USER=dokploy
+POSTGRES_DB=dokploy
+POSTGRES_PASSWORD=${pg_password}
+
+# Redis
+REDIS_VERSION=${REDIS_VERSION}
+
+# Traefik
+TRAEFIK_VERSION=${TRAEFIK_VERSION}
+SKIP_TRAEFIK=${SKIP_TRAEFIK:-false}
+EOF
+
+    chmod 600 "$env_file"
+    log SUCCESS ".env file created at $env_file"
 }
 
-create_postgres_service() {
-    local password="${POSTGRES_PASSWORD:-$(generate_password)}"
-    local endpoint_mode="$1"
+generate_docker_compose() {
+    local data_dir="$1"
+    local compose_file="$data_dir/docker-compose.yml"
 
-    log INFO "Creating PostgreSQL service..."
+    log INFO "Generating docker-compose.yml..."
 
-    run_cmd "docker service create \
-        --name $SERVICE_POSTGRES \
-        --constraint 'node.role==manager' \
-        --network $NETWORK_NAME \
-        --env POSTGRES_USER=dokploy \
-        --env POSTGRES_DB=dokploy \
-        --env POSTGRES_PASSWORD=$password \
-        --mount type=volume,source=dokploy-postgres,target=/var/lib/postgresql/data \
-        $endpoint_mode \
-        postgres:$POSTGRES_VERSION"
+    cat > "$compose_file" << 'EOF'
+# =============================================================================
+# Dokploy Enhanced - Docker Compose Configuration
+# =============================================================================
+#
+# This file is auto-generated. Edit .env to change configuration.
+# Re-run install.sh to regenerate this file if needed.
+#
 
-    log SUCCESS "PostgreSQL service created."
-    echo "$password"
+services:
+  # ===========================================================================
+  # Dokploy - Main Application
+  # ===========================================================================
+  dokploy:
+    image: ${DOKPLOY_REGISTRY}/${DOKPLOY_IMAGE}:${DOKPLOY_VERSION}
+    container_name: dokploy
+    restart: unless-stopped
+    networks:
+      - dokploy-network
+    ports:
+      - "${DOKPLOY_PORT}:3000"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${DATA_DIR}:/etc/dokploy
+      - dokploy-docker:/root/.docker
+    environment:
+      - ADVERTISE_ADDR=${ADVERTISE_ADDR}
+    depends_on:
+      - postgres
+      - redis
+    deploy:
+      mode: replicated
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+
+  # ===========================================================================
+  # PostgreSQL - Database
+  # ===========================================================================
+  postgres:
+    image: postgres:${POSTGRES_VERSION}
+    container_name: dokploy-postgres
+    restart: unless-stopped
+    networks:
+      - dokploy-network
+    volumes:
+      - dokploy-postgres:/var/lib/postgresql/data
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_DB=${POSTGRES_DB}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ===========================================================================
+  # Redis - Cache & Queue
+  # ===========================================================================
+  redis:
+    image: redis:${REDIS_VERSION}
+    container_name: dokploy-redis
+    restart: unless-stopped
+    networks:
+      - dokploy-network
+    volumes:
+      - dokploy-redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ===========================================================================
+  # Traefik - Reverse Proxy (Optional)
+  # ===========================================================================
+  traefik:
+    image: traefik:${TRAEFIK_VERSION}
+    container_name: dokploy-traefik
+    restart: unless-stopped
+    profiles:
+      - traefik
+    networks:
+      - dokploy-network
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ${DATA_DIR}/traefik/traefik.yml:/etc/traefik/traefik.yml:ro
+      - ${DATA_DIR}/traefik/dynamic:/etc/traefik/dynamic:ro
+      - ${DATA_DIR}/traefik/acme:/etc/traefik/acme
+
+# =============================================================================
+# Networks
+# =============================================================================
+networks:
+  dokploy-network:
+    external: true
+    name: ${NETWORK_NAME}
+
+# =============================================================================
+# Volumes
+# =============================================================================
+volumes:
+  dokploy-docker:
+    name: dokploy-docker
+  dokploy-postgres:
+    name: dokploy-postgres
+  dokploy-redis:
+    name: dokploy-redis
+EOF
+
+    log SUCCESS "docker-compose.yml created at $compose_file"
 }
 
-create_redis_service() {
-    local endpoint_mode="$1"
+generate_traefik_config() {
+    local data_dir="$1"
 
-    log INFO "Creating Redis service..."
+    log INFO "Setting up Traefik configuration..."
 
-    run_cmd "docker service create \
-        --name $SERVICE_REDIS \
-        --constraint 'node.role==manager' \
-        --network $NETWORK_NAME \
-        --mount type=volume,source=dokploy-redis,target=/data \
-        $endpoint_mode \
-        redis:$REDIS_VERSION"
-
-    log SUCCESS "Redis service created."
-}
-
-create_dokploy_service() {
-    local advertise_addr="$1"
-    local endpoint_mode="$2"
-    local version="${DOKPLOY_VERSION:-$DEFAULT_VERSION}"
-    local registry="${DOKPLOY_REGISTRY:-$DEFAULT_REGISTRY}"
-    local image="${DOKPLOY_IMAGE:-$DEFAULT_IMAGE}"
-    local port="${DOKPLOY_PORT:-$DEFAULT_PORT}"
-    local data_dir="${DOKPLOY_DATA_DIR:-$DEFAULT_DATA_DIR}"
-
-    local full_image="$registry/$image:$version"
-
-    log INFO "Creating Dokploy Enhanced service..."
-    log INFO "Using image: $full_image"
-
-    # Build the docker service create command
-    local docker_cmd="docker service create"
-    docker_cmd="$docker_cmd --name $SERVICE_DOKPLOY"
-    docker_cmd="$docker_cmd --replicas 1"
-    docker_cmd="$docker_cmd --network $NETWORK_NAME"
-    docker_cmd="$docker_cmd --mount type=bind,source=/var/run/docker.sock,target=/var/run/docker.sock"
-    docker_cmd="$docker_cmd --mount type=bind,source=$data_dir,target=/etc/dokploy"
-    docker_cmd="$docker_cmd --mount type=volume,source=dokploy,target=/root/.docker"
-    docker_cmd="$docker_cmd --publish published=$port,target=3000,mode=host"
-    docker_cmd="$docker_cmd --update-parallelism 1"
-    docker_cmd="$docker_cmd --update-order stop-first"
-    docker_cmd="$docker_cmd --constraint 'node.role==manager'"
-    docker_cmd="$docker_cmd --env ADVERTISE_ADDR=$advertise_addr"
-
-    # Add endpoint mode if set (for LXC compatibility)
-    if [[ -n "$endpoint_mode" ]]; then
-        docker_cmd="$docker_cmd $endpoint_mode"
-    fi
-
-    # Add release tag env if not latest
-    if [[ "$version" != "latest" ]]; then
-        docker_cmd="$docker_cmd --env RELEASE_TAG=$version"
-    fi
-
-    # Add the image at the end
-    docker_cmd="$docker_cmd $full_image"
-
-    run_cmd "$docker_cmd"
-
-    log SUCCESS "Dokploy Enhanced service created."
-}
-
-create_traefik_container() {
-    local data_dir="${DOKPLOY_DATA_DIR:-$DEFAULT_DATA_DIR}"
-
-    if [[ "${SKIP_TRAEFIK:-false}" == "true" ]]; then
-        log WARN "Skipping Traefik installation (SKIP_TRAEFIK=true)."
-        return 0
-    fi
-
-    log INFO "Creating Traefik container..."
-
-    # Wait for Dokploy to create traefik config
-    local max_wait=30
-    local waited=0
-    while [[ ! -f "$data_dir/traefik/traefik.yml" && $waited -lt $max_wait ]]; do
-        sleep 1
-        ((waited++))
-    done
+    mkdir -p "$data_dir/traefik/dynamic"
+    mkdir -p "$data_dir/traefik/acme"
 
     if [[ ! -f "$data_dir/traefik/traefik.yml" ]]; then
-        log WARN "Traefik config not found. Dokploy will create it on first start."
+        cat > "$data_dir/traefik/traefik.yml" << 'EOF'
+# =============================================================================
+# Traefik Configuration for Dokploy Enhanced
+# =============================================================================
+
+api:
+  insecure: true
+  dashboard: true
+
+entryPoints:
+  web:
+    address: ":80"
+    http:
+      redirections:
+        entryPoint:
+          to: websecure
+          scheme: https
+          permanent: true
+  websecure:
+    address: ":443"
+    http3: {}
+
+providers:
+  docker:
+    endpoint: "unix:///var/run/docker.sock"
+    exposedByDefault: false
+    network: dokploy-network
+  file:
+    directory: "/etc/traefik/dynamic"
+    watch: true
+
+certificatesResolvers:
+  letsencrypt:
+    acme:
+      email: admin@example.com
+      storage: /etc/traefik/acme/acme.json
+      httpChallenge:
+        entryPoint: web
+
+log:
+  level: "ERROR"
+
+accessLog: {}
+EOF
+        log SUCCESS "Traefik configuration created."
+    else
+        log INFO "Traefik configuration already exists."
     fi
+}
 
-    # Remove existing container if any
-    docker rm -f "$CONTAINER_TRAEFIK" 2>/dev/null || true
+# =============================================================================
+# Docker Compose Wrapper
+# =============================================================================
 
-    run_cmd "docker run -d \
-        --name $CONTAINER_TRAEFIK \
-        --restart always \
-        -v $data_dir/traefik/traefik.yml:/etc/traefik/traefik.yml \
-        -v $data_dir/traefik/dynamic:/etc/dokploy/traefik/dynamic \
-        -v /var/run/docker.sock:/var/run/docker.sock:ro \
-        -p 80:80/tcp \
-        -p 443:443/tcp \
-        -p 443:443/udp \
-        traefik:$TRAEFIK_VERSION"
+compose_cmd() {
+    local data_dir="${DOKPLOY_DATA_DIR:-$DEFAULT_DATA_DIR}"
 
-    # Connect Traefik to the network
-    run_cmd "docker network connect $NETWORK_NAME $CONTAINER_TRAEFIK" || true
-
-    log SUCCESS "Traefik container created."
+    if docker compose version &>/dev/null; then
+        docker compose -f "$data_dir/docker-compose.yml" --env-file "$data_dir/.env" "$@"
+    else
+        docker-compose -f "$data_dir/docker-compose.yml" --env-file "$data_dir/.env" "$@"
+    fi
 }
 
 # =============================================================================
@@ -495,28 +558,9 @@ cmd_install() {
     check_os
     check_required_ports
 
-    # Environment info
-    local distro
-    distro=$(get_distro)
-    log INFO "Detected distribution: $distro"
-
-    if is_proxmox_lxc; then
-        log WARN "Detected Proxmox LXC container environment."
-        log WARN "Adding --endpoint-mode dnsrr for LXC compatibility."
-    fi
-
-    if is_wsl; then
-        log WARN "Detected WSL environment. Some features may not work correctly."
-    fi
-
-    # Install Docker
+    # Install Docker and Docker Compose
     install_docker
-
-    # Determine endpoint mode for LXC
-    local endpoint_mode=""
-    if is_proxmox_lxc; then
-        endpoint_mode="--endpoint-mode dnsrr"
-    fi
+    install_docker_compose
 
     # Initialize Swarm
     local advertise_addr
@@ -528,21 +572,29 @@ cmd_install() {
     # Create data directory
     local data_dir="${DOKPLOY_DATA_DIR:-$DEFAULT_DATA_DIR}"
     mkdir -p "$data_dir"
-    chmod 777 "$data_dir"
+    chmod 755 "$data_dir"
     log SUCCESS "Data directory created: $data_dir"
 
-    # Create services
-    local pg_password
-    pg_password=$(create_postgres_service "$endpoint_mode")
-    create_redis_service "$endpoint_mode"
-    create_dokploy_service "$advertise_addr" "$endpoint_mode"
+    # Generate PostgreSQL password
+    local pg_password="${POSTGRES_PASSWORD:-$(generate_password)}"
 
-    # Wait a bit for services to start
+    # Generate configuration files
+    generate_env_file "$data_dir" "$advertise_addr" "$pg_password"
+    generate_docker_compose "$data_dir"
+    generate_traefik_config "$data_dir"
+
+    # Start services
+    log INFO "Starting services with docker-compose..."
+
+    if [[ "${SKIP_TRAEFIK:-false}" == "true" ]]; then
+        compose_cmd up -d
+    else
+        compose_cmd --profile traefik up -d
+    fi
+
+    # Wait for services to start
     log INFO "Waiting for services to initialize..."
     sleep 5
-
-    # Create Traefik
-    create_traefik_container
 
     # Get access URL
     local public_ip
@@ -550,26 +602,6 @@ cmd_install() {
     local formatted_addr
     formatted_addr=$(format_ip_for_url "$public_ip")
     local port="${DOKPLOY_PORT:-$DEFAULT_PORT}"
-
-    # Success message
-    echo ""
-    printf "${GREEN}============================================${NC}\n"
-    printf "${GREEN}  Dokploy Enhanced Installation Complete!   ${NC}\n"
-    printf "${GREEN}============================================${NC}\n"
-    echo ""
-    printf "${CYAN}Access your Dokploy instance at:${NC}\n"
-    printf "${YELLOW}  http://${formatted_addr}:${port}${NC}\n"
-    echo ""
-    printf "${BLUE}Please wait 15-30 seconds for all services to fully start.${NC}\n"
-    echo ""
-    printf "${CYAN}PostgreSQL password:${NC} ${pg_password}\n"
-    printf "${CYAN}Data directory:${NC} ${data_dir}\n"
-    echo ""
-    printf "${CYAN}Useful commands:${NC}\n"
-    printf "  View status:    ${YELLOW}docker service ls${NC}\n"
-    printf "  View logs:      ${YELLOW}docker service logs dokploy${NC}\n"
-    printf "  Update:         ${YELLOW}curl -sSL <install-url> | bash -s -- update${NC}\n"
-    echo ""
 
     # Save installation info
     cat > "$data_dir/install-info.json" << EOF
@@ -585,26 +617,142 @@ cmd_install() {
 }
 EOF
 
+    # Success message
+    echo ""
+    printf "${GREEN}============================================${NC}\n"
+    printf "${GREEN}  Dokploy Enhanced Installation Complete!   ${NC}\n"
+    printf "${GREEN}============================================${NC}\n"
+    echo ""
+    printf "${CYAN}Access your Dokploy instance at:${NC}\n"
+    printf "${YELLOW}  http://${formatted_addr}:${port}${NC}\n"
+    echo ""
+    printf "${BLUE}Please wait 15-30 seconds for all services to fully start.${NC}\n"
+    echo ""
+    printf "${CYAN}Configuration files:${NC}\n"
+    printf "  .env file:           ${YELLOW}${data_dir}/.env${NC}\n"
+    printf "  docker-compose.yml:  ${YELLOW}${data_dir}/docker-compose.yml${NC}\n"
+    printf "  Traefik config:      ${YELLOW}${data_dir}/traefik/traefik.yml${NC}\n"
+    echo ""
+    printf "${CYAN}PostgreSQL password:${NC} ${pg_password}\n"
+    echo ""
+    printf "${CYAN}Useful commands:${NC}\n"
+    printf "  View status:    ${YELLOW}$0 status${NC}\n"
+    printf "  View logs:      ${YELLOW}$0 logs${NC}\n"
+    printf "  Stop services:  ${YELLOW}$0 stop${NC}\n"
+    printf "  Start services: ${YELLOW}$0 start${NC}\n"
+    printf "  Update:         ${YELLOW}$0 update${NC}\n"
+    echo ""
+
     log SUCCESS "Installation completed successfully!"
 }
 
 cmd_update() {
     log INFO "Updating Dokploy Enhanced..."
-
     check_root
 
-    local version="${DOKPLOY_VERSION:-$DEFAULT_VERSION}"
-    local registry="${DOKPLOY_REGISTRY:-$DEFAULT_REGISTRY}"
-    local image="${DOKPLOY_IMAGE:-$DEFAULT_IMAGE}"
-    local full_image="$registry/$image:$version"
+    local data_dir="${DOKPLOY_DATA_DIR:-$DEFAULT_DATA_DIR}"
 
-    log INFO "Pulling new image: $full_image"
-    run_cmd "docker pull $full_image"
+    if [[ ! -f "$data_dir/docker-compose.yml" ]]; then
+        die "docker-compose.yml not found. Please run install first."
+    fi
 
-    log INFO "Updating Dokploy service..."
-    run_cmd "docker service update --image $full_image $SERVICE_DOKPLOY"
+    log INFO "Pulling latest images..."
+    compose_cmd pull
 
-    log SUCCESS "Dokploy Enhanced updated to version: $version"
+    log INFO "Recreating containers with new images..."
+    if [[ "${SKIP_TRAEFIK:-false}" == "true" ]]; then
+        compose_cmd up -d
+    else
+        compose_cmd --profile traefik up -d
+    fi
+
+    log SUCCESS "Dokploy Enhanced updated successfully!"
+}
+
+cmd_stop() {
+    log INFO "Stopping Dokploy Enhanced services..."
+    check_root
+
+    compose_cmd stop
+
+    log SUCCESS "Services stopped."
+}
+
+cmd_start() {
+    log INFO "Starting Dokploy Enhanced services..."
+    check_root
+
+    if [[ "${SKIP_TRAEFIK:-false}" == "true" ]]; then
+        compose_cmd up -d
+    else
+        compose_cmd --profile traefik up -d
+    fi
+
+    log SUCCESS "Services started."
+}
+
+cmd_restart() {
+    log INFO "Restarting Dokploy Enhanced services..."
+    check_root
+
+    compose_cmd restart
+
+    log SUCCESS "Services restarted."
+}
+
+cmd_status() {
+    local data_dir="${DOKPLOY_DATA_DIR:-$DEFAULT_DATA_DIR}"
+
+    echo ""
+    printf "${CYAN}=== Dokploy Enhanced Status ===${NC}\n"
+    echo ""
+
+    printf "${BOLD}Services:${NC}\n"
+    compose_cmd ps
+    echo ""
+
+    printf "${BOLD}Docker Swarm:${NC}\n"
+    docker info 2>/dev/null | grep -E "Swarm:|Node Address:|Manager Addresses:" || echo "Not in swarm mode"
+    echo ""
+
+    printf "${BOLD}Networks:${NC}\n"
+    docker network ls --filter "name=$NETWORK_NAME" 2>/dev/null
+    echo ""
+
+    printf "${BOLD}Volumes:${NC}\n"
+    docker volume ls --filter "name=dokploy" 2>/dev/null
+    echo ""
+
+    if [[ -f "$data_dir/.env" ]]; then
+        printf "${BOLD}Configuration (.env):${NC}\n"
+        grep -v "PASSWORD" "$data_dir/.env" | grep -v "^#" | grep -v "^$" | head -20
+        echo ""
+    fi
+
+    if [[ -f "$data_dir/install-info.json" ]]; then
+        printf "${BOLD}Installation Info:${NC}\n"
+        cat "$data_dir/install-info.json"
+        echo ""
+    fi
+}
+
+cmd_logs() {
+    local service="${1:-}"
+    local follow="${2:-}"
+
+    if [[ -n "$service" && "$service" != "-f" ]]; then
+        if [[ "$follow" == "-f" ]]; then
+            compose_cmd logs -f "$service"
+        else
+            compose_cmd logs --tail 100 "$service"
+        fi
+    else
+        if [[ "$service" == "-f" || "$follow" == "-f" ]]; then
+            compose_cmd logs -f
+        else
+            compose_cmd logs --tail 100
+        fi
+    fi
 }
 
 cmd_uninstall() {
@@ -617,29 +765,26 @@ cmd_uninstall() {
 
     check_root
 
-    log INFO "Stopping and removing services..."
+    local data_dir="${DOKPLOY_DATA_DIR:-$DEFAULT_DATA_DIR}"
 
-    # Remove services
-    docker service rm "$SERVICE_DOKPLOY" 2>/dev/null || true
-    docker service rm "$SERVICE_POSTGRES" 2>/dev/null || true
-    docker service rm "$SERVICE_REDIS" 2>/dev/null || true
+    log INFO "Stopping and removing containers..."
+    compose_cmd --profile traefik down 2>/dev/null || true
 
-    # Remove Traefik container
-    docker rm -f "$CONTAINER_TRAEFIK" 2>/dev/null || true
+    if confirm "Remove Docker volumes (this will delete all data)?"; then
+        log INFO "Removing Docker volumes..."
+        compose_cmd --profile traefik down -v 2>/dev/null || true
+        docker volume rm dokploy-docker dokploy-postgres dokploy-redis 2>/dev/null || true
+    fi
 
     # Remove network
     docker network rm "$NETWORK_NAME" 2>/dev/null || true
 
     # Leave swarm
-    docker swarm leave --force 2>/dev/null || true
-
-    if confirm "Remove Docker volumes (this will delete all data)?"; then
-        log INFO "Removing Docker volumes..."
-        docker volume rm dokploy dokploy-postgres dokploy-redis 2>/dev/null || true
+    if confirm "Leave Docker Swarm?"; then
+        docker swarm leave --force 2>/dev/null || true
     fi
 
-    if confirm "Remove data directory (${DOKPLOY_DATA_DIR:-$DEFAULT_DATA_DIR})?"; then
-        local data_dir="${DOKPLOY_DATA_DIR:-$DEFAULT_DATA_DIR}"
+    if confirm "Remove data directory ($data_dir)?"; then
         rm -rf "$data_dir"
         log INFO "Data directory removed."
     fi
@@ -647,39 +792,11 @@ cmd_uninstall() {
     log SUCCESS "Dokploy Enhanced has been uninstalled."
 }
 
-cmd_status() {
-    echo ""
-    printf "${CYAN}=== Dokploy Enhanced Status ===${NC}\n"
-    echo ""
-
-    printf "${BOLD}Docker Services:${NC}\n"
-    docker service ls 2>/dev/null || echo "No swarm services found."
-    echo ""
-
-    printf "${BOLD}Containers:${NC}\n"
-    docker ps --filter "name=dokploy" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}" 2>/dev/null
-    echo ""
-
-    printf "${BOLD}Volumes:${NC}\n"
-    docker volume ls --filter "name=dokploy" 2>/dev/null
-    echo ""
-
-    printf "${BOLD}Network:${NC}\n"
-    docker network ls --filter "name=$NETWORK_NAME" 2>/dev/null
-    echo ""
-
-    local data_dir="${DOKPLOY_DATA_DIR:-$DEFAULT_DATA_DIR}"
-    if [[ -f "$data_dir/install-info.json" ]]; then
-        printf "${BOLD}Installation Info:${NC}\n"
-        cat "$data_dir/install-info.json"
-        echo ""
-    fi
-}
-
 cmd_backup() {
     check_root
 
-    local backup_dir="${BACKUP_DIR:-$DEFAULT_BACKUP_DIR}"
+    local data_dir="${DOKPLOY_DATA_DIR:-$DEFAULT_DATA_DIR}"
+    local backup_dir="${BACKUP_DIR:-/var/backups/dokploy}"
     local timestamp
     timestamp=$(date +%Y%m%d_%H%M%S)
     local backup_path="$backup_dir/dokploy_backup_$timestamp"
@@ -688,14 +805,11 @@ cmd_backup() {
 
     mkdir -p "$backup_path"
 
-    # Backup data directory
-    local data_dir="${DOKPLOY_DATA_DIR:-$DEFAULT_DATA_DIR}"
-    if [[ -d "$data_dir" ]]; then
-        log INFO "Backing up data directory..."
-        cp -r "$data_dir" "$backup_path/data"
-    fi
+    # Backup configuration files
+    log INFO "Backing up configuration..."
+    cp -r "$data_dir" "$backup_path/config"
 
-    # Backup Docker volumes
+    # Backup PostgreSQL
     log INFO "Backing up PostgreSQL data..."
     docker run --rm \
         -v dokploy-postgres:/data \
@@ -703,6 +817,7 @@ cmd_backup() {
         alpine tar czf /backup/postgres.tar.gz -C /data . 2>/dev/null || \
         log WARN "PostgreSQL backup failed or volume doesn't exist."
 
+    # Backup Redis
     log INFO "Backing up Redis data..."
     docker run --rm \
         -v dokploy-redis:/data \
@@ -722,70 +837,6 @@ EOF
     log SUCCESS "Backup completed: $backup_path"
 }
 
-cmd_restore() {
-    check_root
-
-    local backup_path="$1"
-
-    if [[ -z "$backup_path" || ! -d "$backup_path" ]]; then
-        die "Please provide a valid backup directory path."
-    fi
-
-    log WARN "This will restore from backup and overwrite current data!"
-
-    if ! confirm "Are you sure you want to continue?"; then
-        log INFO "Restore cancelled."
-        exit 0
-    fi
-
-    log INFO "Restoring from: $backup_path"
-
-    # Stop services
-    docker service scale "$SERVICE_DOKPLOY=0" 2>/dev/null || true
-
-    # Restore data directory
-    local data_dir="${DOKPLOY_DATA_DIR:-$DEFAULT_DATA_DIR}"
-    if [[ -d "$backup_path/data" ]]; then
-        log INFO "Restoring data directory..."
-        rm -rf "$data_dir"
-        cp -r "$backup_path/data" "$data_dir"
-    fi
-
-    # Restore PostgreSQL
-    if [[ -f "$backup_path/postgres.tar.gz" ]]; then
-        log INFO "Restoring PostgreSQL data..."
-        docker run --rm \
-            -v dokploy-postgres:/data \
-            -v "$backup_path":/backup \
-            alpine sh -c "rm -rf /data/* && tar xzf /backup/postgres.tar.gz -C /data"
-    fi
-
-    # Restore Redis
-    if [[ -f "$backup_path/redis.tar.gz" ]]; then
-        log INFO "Restoring Redis data..."
-        docker run --rm \
-            -v dokploy-redis:/data \
-            -v "$backup_path":/backup \
-            alpine sh -c "rm -rf /data/* && tar xzf /backup/redis.tar.gz -C /data"
-    fi
-
-    # Restart services
-    docker service scale "$SERVICE_DOKPLOY=1" 2>/dev/null || true
-
-    log SUCCESS "Restore completed!"
-}
-
-cmd_logs() {
-    local service="${1:-$SERVICE_DOKPLOY}"
-    local follow="${2:-}"
-
-    if [[ "$follow" == "-f" || "$follow" == "--follow" ]]; then
-        docker service logs -f "$service"
-    else
-        docker service logs --tail 100 "$service"
-    fi
-}
-
 cmd_help() {
     cat << EOF
 ${BOLD}Dokploy Enhanced Installer v${SCRIPT_VERSION}${NC}
@@ -795,12 +846,15 @@ ${CYAN}Usage:${NC}
 
 ${CYAN}Commands:${NC}
     install     Install Dokploy Enhanced (default if no command given)
-    update      Update Dokploy Enhanced to the latest version
-    uninstall   Remove Dokploy Enhanced and optionally all data
-    status      Show current status of Dokploy Enhanced
-    backup      Create a backup of all Dokploy data
-    restore     Restore from a backup (requires backup path)
+    update      Pull latest images and recreate containers
+    start       Start all services
+    stop        Stop all services
+    restart     Restart all services
+    status      Show current status of all services
     logs        Show service logs (use -f to follow)
+    backup      Create a backup of all data
+    migrate     Migrate from official Dokploy to Dokploy Enhanced
+    uninstall   Remove Dokploy Enhanced and optionally all data
     help        Show this help message
 
 ${CYAN}Environment Variables:${NC}
@@ -810,14 +864,18 @@ ${CYAN}Environment Variables:${NC}
     DOKPLOY_IMAGE            Docker image name (default: dokploy-enhanced)
     DOKPLOY_DATA_DIR         Data directory (default: /etc/dokploy)
     ADVERTISE_ADDR           Docker Swarm advertise address
-    DOCKER_SWARM_INIT_ARGS   Additional Docker Swarm init arguments
     SKIP_DOCKER_INSTALL      Skip Docker installation (true/false)
     SKIP_TRAEFIK             Skip Traefik installation (true/false)
     POSTGRES_PASSWORD        Custom PostgreSQL password
-    BACKUP_DIR               Backup directory (default: /var/backups/dokploy)
     DRY_RUN                  Show commands without executing (true/false)
     FORCE                    Force installation even with warnings (true/false)
     DEBUG                    Enable debug output (true/false)
+
+${CYAN}Configuration Files:${NC}
+    After installation, configuration is stored in:
+    - ${DEFAULT_DATA_DIR}/.env              - Environment variables
+    - ${DEFAULT_DATA_DIR}/docker-compose.yml - Docker Compose configuration
+    - ${DEFAULT_DATA_DIR}/traefik/          - Traefik configuration
 
 ${CYAN}Examples:${NC}
     # Basic installation
@@ -829,20 +887,306 @@ ${CYAN}Examples:${NC}
     # Install with custom port
     DOKPLOY_PORT=8080 curl -sSL <url> | bash
 
-    # Update to latest
-    curl -sSL <url> | bash -s -- update
+    # Migrate from official Dokploy
+    $0 migrate
 
-    # Create backup
-    curl -sSL <url> | bash -s -- backup
+    # Update to latest
+    $0 update
+
+    # View logs
+    $0 logs -f
 
     # Show status
-    curl -sSL <url> | bash -s -- status
+    $0 status
 
 ${CYAN}More Information:${NC}
     GitHub: https://github.com/amirhmoradi/dokploy-enhanced
     Docs:   https://github.com/amirhmoradi/dokploy-enhanced#readme
 
 EOF
+}
+
+# =============================================================================
+# Migration from Official Dokploy
+# =============================================================================
+
+detect_official_dokploy() {
+    # Check if official Dokploy Docker Swarm services exist
+    if docker service ls 2>/dev/null | grep -q "dokploy"; then
+        return 0
+    fi
+    return 1
+}
+
+get_service_env() {
+    local service_name="$1"
+    local env_name="$2"
+    docker service inspect "$service_name" 2>/dev/null | \
+        grep -oP "(?<=\"${env_name}=)[^\"]*" | head -1
+}
+
+get_postgres_password_from_service() {
+    # Try to get password from dokploy-postgres service
+    local password
+    password=$(docker service inspect dokploy-postgres 2>/dev/null | \
+        grep -oP '(?<="POSTGRES_PASSWORD=)[^"]*' | head -1)
+
+    if [[ -z "$password" ]]; then
+        # Try to get from dokploy service DATABASE_URL
+        local db_url
+        db_url=$(docker service inspect dokploy 2>/dev/null | \
+            grep -oP '(?<="DATABASE_URL=)[^"]*' | head -1)
+        if [[ -n "$db_url" ]]; then
+            # Extract password from postgresql://user:password@host/db
+            password=$(echo "$db_url" | grep -oP '(?<=:)[^:@]+(?=@)')
+        fi
+    fi
+
+    echo "$password"
+}
+
+get_advertise_addr_from_swarm() {
+    docker info 2>/dev/null | grep -oP '(?<=Advertise Address: )[^\s]+' | head -1
+}
+
+cmd_migrate() {
+    log INFO "Starting migration from official Dokploy to Dokploy Enhanced..."
+    log INFO "Script version: $SCRIPT_VERSION"
+
+    check_root
+
+    # Check if official Dokploy is installed
+    if ! detect_official_dokploy; then
+        log ERROR "No official Dokploy installation detected."
+        log INFO "This command migrates an existing official Dokploy installation"
+        log INFO "to the Dokploy Enhanced docker-compose based setup."
+        log INFO ""
+        log INFO "If you want a fresh install, use: $0 install"
+        exit 1
+    fi
+
+    log SUCCESS "Official Dokploy installation detected."
+
+    # Show current state
+    echo ""
+    printf "${CYAN}Current Docker Swarm Services:${NC}\n"
+    docker service ls 2>/dev/null | grep -E "dokploy|REPLICAS"
+    echo ""
+
+    printf "${CYAN}Current Docker Containers:${NC}\n"
+    docker ps --filter "name=dokploy" --format "table {{.Names}}\t{{.Image}}\t{{.Status}}" 2>/dev/null
+    echo ""
+
+    printf "${CYAN}Current Docker Volumes:${NC}\n"
+    docker volume ls --filter "name=dokploy" 2>/dev/null
+    echo ""
+
+    # Confirm migration
+    log WARN "This will migrate your official Dokploy installation to Dokploy Enhanced."
+    log WARN "The migration will:"
+    log WARN "  1. Extract configuration from existing services"
+    log WARN "  2. Create a backup of current state"
+    log WARN "  3. Stop and remove Docker Swarm services"
+    log WARN "  4. Generate docker-compose.yml and .env files"
+    log WARN "  5. Start services using docker-compose"
+    log WARN ""
+    log WARN "Your data (PostgreSQL, Redis, /etc/dokploy) will be PRESERVED."
+    echo ""
+
+    if ! confirm "Do you want to proceed with the migration?"; then
+        log INFO "Migration cancelled."
+        exit 0
+    fi
+
+    local data_dir="${DOKPLOY_DATA_DIR:-$DEFAULT_DATA_DIR}"
+
+    # Extract configuration from existing installation
+    log INFO "Extracting configuration from existing installation..."
+
+    # Get advertise address
+    local advertise_addr
+    advertise_addr=$(get_advertise_addr_from_swarm)
+    if [[ -z "$advertise_addr" ]]; then
+        advertise_addr=$(get_private_ip)
+    fi
+    log INFO "Advertise address: $advertise_addr"
+
+    # Get PostgreSQL password
+    local pg_password
+    pg_password=$(get_postgres_password_from_service)
+    if [[ -z "$pg_password" ]]; then
+        log WARN "Could not extract PostgreSQL password from existing service."
+        log WARN "A new password will be generated. You may need to reset the database."
+        pg_password=$(generate_password)
+    else
+        log SUCCESS "PostgreSQL password extracted from existing service."
+    fi
+
+    # Get port from existing service
+    local port="${DOKPLOY_PORT:-$DEFAULT_PORT}"
+    local existing_port
+    existing_port=$(docker service inspect dokploy 2>/dev/null | \
+        grep -oP '(?<="PublishedPort":)\d+' | head -1)
+    if [[ -n "$existing_port" ]]; then
+        port="$existing_port"
+        log INFO "Using existing port: $port"
+    fi
+
+    # Create backup before migration
+    log INFO "Creating backup before migration..."
+    local backup_dir="/var/backups/dokploy"
+    local timestamp
+    timestamp=$(date +%Y%m%d_%H%M%S)
+    local backup_path="$backup_dir/pre_migration_$timestamp"
+    mkdir -p "$backup_path"
+
+    # Backup configuration
+    if [[ -d "$data_dir" ]]; then
+        cp -r "$data_dir" "$backup_path/config" 2>/dev/null || true
+    fi
+
+    # Save service configurations
+    docker service inspect dokploy > "$backup_path/dokploy-service.json" 2>/dev/null || true
+    docker service inspect dokploy-postgres > "$backup_path/dokploy-postgres-service.json" 2>/dev/null || true
+    docker service inspect dokploy-redis > "$backup_path/dokploy-redis-service.json" 2>/dev/null || true
+
+    # Save current state
+    cat > "$backup_path/migration-info.json" << EOF
+{
+    "migrated_at": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
+    "from": "official-dokploy",
+    "to": "dokploy-enhanced",
+    "script_version": "$SCRIPT_VERSION",
+    "advertise_addr": "$advertise_addr",
+    "port": "$port"
+}
+EOF
+
+    log SUCCESS "Backup created at: $backup_path"
+
+    # Stop and remove old services
+    log INFO "Stopping Docker Swarm services..."
+
+    # Stop dokploy service first (depends on postgres and redis)
+    docker service rm dokploy 2>/dev/null || true
+    sleep 2
+
+    # Stop postgres and redis
+    docker service rm dokploy-postgres 2>/dev/null || true
+    docker service rm dokploy-redis 2>/dev/null || true
+
+    # Stop traefik container
+    docker rm -f dokploy-traefik 2>/dev/null || true
+
+    log SUCCESS "Old services stopped."
+
+    # Ensure network exists (don't remove it, just make sure it's there)
+    log INFO "Ensuring network exists..."
+    if ! docker network ls | grep -q "$NETWORK_NAME"; then
+        docker network create --driver overlay --attachable "$NETWORK_NAME"
+    fi
+
+    # Ensure data directory exists
+    mkdir -p "$data_dir"
+    chmod 755 "$data_dir"
+
+    # Generate new configuration files
+    log INFO "Generating docker-compose configuration..."
+
+    # Override port and password for generate functions
+    DOKPLOY_PORT="$port"
+
+    generate_env_file "$data_dir" "$advertise_addr" "$pg_password"
+    generate_docker_compose "$data_dir"
+    generate_traefik_config "$data_dir"
+
+    # Start services with docker-compose
+    log INFO "Starting services with docker-compose..."
+
+    if [[ "${SKIP_TRAEFIK:-false}" == "true" ]]; then
+        compose_cmd up -d
+    else
+        compose_cmd --profile traefik up -d
+    fi
+
+    # Wait for services to start
+    log INFO "Waiting for services to initialize..."
+    sleep 10
+
+    # Verify migration
+    log INFO "Verifying migration..."
+    local success=true
+
+    if ! docker ps | grep -q "dokploy"; then
+        log ERROR "Dokploy container is not running!"
+        success=false
+    fi
+
+    if ! docker ps | grep -q "dokploy-postgres"; then
+        log ERROR "PostgreSQL container is not running!"
+        success=false
+    fi
+
+    if ! docker ps | grep -q "dokploy-redis"; then
+        log ERROR "Redis container is not running!"
+        success=false
+    fi
+
+    if [[ "$success" == "true" ]]; then
+        # Save installation info
+        cat > "$data_dir/install-info.json" << EOF
+{
+    "installed_at": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
+    "migrated_from": "official-dokploy",
+    "script_version": "$SCRIPT_VERSION",
+    "docker_version": "$(docker --version 2>/dev/null)",
+    "advertise_addr": "$advertise_addr",
+    "port": "$port",
+    "registry": "${DOKPLOY_REGISTRY:-$DEFAULT_REGISTRY}",
+    "image": "${DOKPLOY_IMAGE:-$DEFAULT_IMAGE}",
+    "version": "${DOKPLOY_VERSION:-$DEFAULT_VERSION}"
+}
+EOF
+
+        local public_ip
+        public_ip="${ADVERTISE_ADDR:-$(get_public_ip)}" || public_ip="$advertise_addr"
+        local formatted_addr
+        formatted_addr=$(format_ip_for_url "$public_ip")
+
+        echo ""
+        printf "${GREEN}============================================${NC}\n"
+        printf "${GREEN}  Migration Completed Successfully!         ${NC}\n"
+        printf "${GREEN}============================================${NC}\n"
+        echo ""
+        printf "${CYAN}Access your Dokploy instance at:${NC}\n"
+        printf "${YELLOW}  http://${formatted_addr}:${port}${NC}\n"
+        echo ""
+        printf "${CYAN}Your data has been preserved:${NC}\n"
+        printf "  - PostgreSQL data (dokploy-postgres volume)\n"
+        printf "  - Redis data (dokploy-redis volume)\n"
+        printf "  - Configuration (/etc/dokploy)\n"
+        echo ""
+        printf "${CYAN}Configuration files:${NC}\n"
+        printf "  .env file:           ${YELLOW}${data_dir}/.env${NC}\n"
+        printf "  docker-compose.yml:  ${YELLOW}${data_dir}/docker-compose.yml${NC}\n"
+        echo ""
+        printf "${CYAN}Pre-migration backup:${NC}\n"
+        printf "  ${YELLOW}${backup_path}${NC}\n"
+        echo ""
+        printf "${CYAN}Useful commands:${NC}\n"
+        printf "  View status:    ${YELLOW}$0 status${NC}\n"
+        printf "  View logs:      ${YELLOW}$0 logs -f${NC}\n"
+        printf "  Restart:        ${YELLOW}$0 restart${NC}\n"
+        echo ""
+
+        log SUCCESS "Migration completed successfully!"
+    else
+        log ERROR "Migration verification failed!"
+        log ERROR "Check the logs with: $0 logs"
+        log INFO "Pre-migration backup is available at: $backup_path"
+        log INFO "You may need to restore from backup or troubleshoot manually."
+        exit 1
+    fi
 }
 
 # =============================================================================
@@ -859,22 +1203,30 @@ main() {
         update)
             cmd_update
             ;;
-        uninstall|remove)
-            cmd_uninstall
+        start)
+            cmd_start
+            ;;
+        stop)
+            cmd_stop
+            ;;
+        restart)
+            cmd_restart
             ;;
         status)
             cmd_status
             ;;
-        backup)
-            cmd_backup
-            ;;
-        restore)
-            shift
-            cmd_restore "$@"
-            ;;
         logs)
             shift
             cmd_logs "$@"
+            ;;
+        backup)
+            cmd_backup
+            ;;
+        migrate)
+            cmd_migrate
+            ;;
+        uninstall|remove)
+            cmd_uninstall
             ;;
         help|--help|-h)
             cmd_help

@@ -215,120 +215,69 @@ jobs:
           cd dokploy-source
           # Fix corepack and pnpm issues for reliable builds
           #
-          # Problem 1: corepack signature validation fails with newer pnpm versions
+          # Problem: corepack signature validation can fail with certain pnpm versions
           # See: https://github.com/nodejs/corepack/issues/612
           #
-          # Problem 2: pnpm 10+ blocks native module builds (bcrypt, sharp) by default
-          # See: https://github.com/pnpm/pnpm/issues/9042
-          # See: https://pnpm.io/cli/approve-builds
-          #
           # Solution:
-          # 1. Set COREPACK_INTEGRITY_KEYS="" to bypass signature verification
-          # 2. Configure pnpm to allow native module builds (bcrypt, sharp, etc.)
+          # 1. Pin pnpm to version 9.x (same as upstream Dokploy) to avoid pnpm 10 breaking changes
+          # 2. Set COREPACK_INTEGRITY_KEYS="" to bypass signature verification
           # 3. Use architecture-specific cache for native modules
 
           echo "Original Dockerfile (first 20 lines):"
           head -20 Dockerfile
 
-          # 1. Add COREPACK_INTEGRITY_KEYS="" to bypass signature verification
+          # 1. Pin pnpm to version 9 to match upstream and avoid pnpm 10 breaking changes
+          # pnpm 10 has breaking changes that require maintaining a list of native modules
+          echo ""
+          echo "Pinning pnpm to version 9.x..."
+
+          # Find and replace pnpm version in packageManager field or corepack enable
+          # First, update package.json if it specifies pnpm version
+          if [ -f "package.json" ]; then
+            # Check current pnpm version in package.json
+            echo "Current package.json packageManager:"
+            grep -o '"packageManager"[^,}]*' package.json || echo "No packageManager field found"
+
+            # Replace any pnpm@10.x with pnpm@9.15.0
+            sed -i 's/"pnpm@10\.[^"]*"/"pnpm@9.15.0"/g' package.json
+            sed -i 's/"pnpm@latest"/"pnpm@9.15.0"/g' package.json
+
+            # If no packageManager field exists, the Dockerfile handles it
+            echo "Updated package.json packageManager:"
+            grep -o '"packageManager"[^,}]*' package.json || echo "No packageManager field found"
+          fi
+
+          # Also patch the Dockerfile to ensure pnpm 9 is used
+          # Replace any corepack enable pnpm@10 with pnpm@9
+          sed -i 's/corepack enable pnpm@10/corepack enable pnpm@9/g' Dockerfile
+          sed -i 's/corepack prepare pnpm@10/corepack prepare pnpm@9/g' Dockerfile
+
+          # If Dockerfile uses corepack enable without version, add version pinning
+          # Add pnpm version pin after corepack enable if not already versioned
+          sed -i 's/RUN corepack enable$/RUN corepack enable \&\& corepack prepare pnpm@9.15.0 --activate/g' Dockerfile
+
+          # 2. Add COREPACK_INTEGRITY_KEYS="" to bypass signature verification
           sed -i '/ENV PATH="\$PNPM_HOME:\$PATH"/a ENV COREPACK_INTEGRITY_KEYS=""' Dockerfile
 
-          # 2. Fix multi-arch builds: Use TARGETARCH in pnpm cache id
+          # 3. Fix multi-arch builds: Use TARGETARCH in pnpm cache id
           sed -i 's/--mount=type=cache,id=pnpm/--mount=type=cache,id=pnpm-${TARGETARCH}/' Dockerfile
 
-          # 3. Add TARGETARCH build arg if not present (needed for cache key)
+          # 4. Add TARGETARCH build arg if not present (needed for cache key)
           if ! grep -q "ARG TARGETARCH" Dockerfile; then
             sed -i '/FROM .* AS build/a ARG TARGETARCH' Dockerfile
           fi
 
-          # 4. Configure pnpm 10+ to allow native module builds
-          # pnpm 10 blocks lifecycle scripts by default for security
-          # We need to allow bcrypt, sharp, and other native modules to build
-          # Option A: Add onlyBuiltDependencies to pnpm-workspace.yaml
-          # Option B: Use --config.onlyBuiltDependencies flag
-          # We'll modify pnpm install commands to allow all builds in Docker context
-          # This is safe since we're building from trusted upstream source
           echo ""
-          echo "Configuring pnpm to allow native module builds..."
-
-          # Replace 'pnpm install --frozen-lockfile' with version that allows builds
-          sed -i 's/pnpm install --frozen-lockfile/pnpm install --frozen-lockfile --config.confirmModulesPurge=false/g' Dockerfile
-
-          # 5. Fix pnpm v10+ deploy command
-          # pnpm v10 requires inject-workspace-packages=true or --legacy flag
-          # See: https://github.com/orgs/pnpm/discussions/9015
-          # See: https://pnpm.io/cli/deploy
-          echo ""
-          echo "Patching pnpm deploy command for v10+ compatibility..."
-          sed -i 's/pnpm deploy/pnpm deploy --legacy/g' Dockerfile
-          sed -i 's/pnpm --filter=\(.*\) --prod deploy/pnpm --filter=\1 --prod deploy --legacy/g' Dockerfile
-
-          # Create/update pnpm-workspace.yaml to allow native module builds and legacy deploy
-          if [ -f "pnpm-workspace.yaml" ]; then
-            echo "Updating pnpm-workspace.yaml..."
-            # Check if onlyBuiltDependencies already exists
-            if ! grep -q "onlyBuiltDependencies" pnpm-workspace.yaml; then
-              {
-                echo ''
-                echo '# Added by dokploy-enhanced for pnpm v10+ compatibility'
-                echo '# See: https://pnpm.io/settings'
-                echo ''
-                echo '# Allow pnpm deploy without inject-workspace-packages'
-                echo '# See: https://pnpm.io/cli/deploy'
-                echo 'forceLegacyDeploy: true'
-                echo ''
-                echo '# Allow native module builds'
-                echo '# See: https://pnpm.io/settings#onlybuiltdependencies'
-                echo 'onlyBuiltDependencies:'
-                echo '  - bcrypt'
-                echo '  - sharp'
-                echo "  - '@node-rs/*'"
-                echo '  - argon2'
-                echo '  - esbuild'
-                echo '  - turbo'
-                echo '  - prisma'
-                echo "  - '@prisma/client'"
-              } >> pnpm-workspace.yaml
-            fi
-          else
-            echo "Creating pnpm-workspace.yaml..."
-            {
-              echo 'packages:'
-              echo "  - 'apps/*'"
-              echo "  - 'packages/*'"
-              echo ''
-              echo '# Added by dokploy-enhanced for pnpm v10+ compatibility'
-              echo '# See: https://pnpm.io/settings'
-              echo ''
-              echo '# Allow pnpm deploy without inject-workspace-packages'
-              echo '# See: https://pnpm.io/cli/deploy'
-              echo 'forceLegacyDeploy: true'
-              echo ''
-              echo '# Allow native module builds'
-              echo '# See: https://pnpm.io/settings#onlybuiltdependencies'
-              echo 'onlyBuiltDependencies:'
-              echo '  - bcrypt'
-              echo '  - sharp'
-              echo "  - '@node-rs/*'"
-              echo '  - argon2'
-              echo '  - esbuild'
-              echo '  - turbo'
-              echo '  - prisma'
-              echo "  - '@prisma/client'"
-            } > pnpm-workspace.yaml
-          fi
-
-          echo ""
-          echo "Patched Dockerfile (first 25 lines):"
-          head -25 Dockerfile
-
-          echo ""
-          echo "pnpm-workspace.yaml contents:"
-          cat pnpm-workspace.yaml || echo "No pnpm-workspace.yaml found"
+          echo "Patched Dockerfile (first 30 lines):"
+          head -30 Dockerfile
 
           echo ""
           echo "Verifying pnpm version references:"
-          grep -n "pnpm@" Dockerfile || echo "No pnpm@ references found in Dockerfile"
+          grep -n "pnpm" Dockerfile | head -20 || echo "No pnpm references found"
+
+          echo ""
+          echo "package.json packageManager field:"
+          grep "packageManager" package.json || echo "No packageManager in package.json"
 
       - name: Upload prepared source
         uses: actions/upload-artifact@v4
