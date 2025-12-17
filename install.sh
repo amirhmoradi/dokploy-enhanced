@@ -441,24 +441,20 @@ DOKPLOY_VERSION=${DOKPLOY_VERSION:-$DEFAULT_VERSION}
 # Network
 ADVERTISE_ADDR=${advertise_addr}
 DOKPLOY_PORT=${DOKPLOY_PORT:-$DEFAULT_PORT}
-NETWORK_NAME=${NETWORK_NAME}
 
 # Data Directory
 DATA_DIR=${data_dir}
 
 # PostgreSQL
-POSTGRES_VERSION=${POSTGRES_VERSION}
 POSTGRES_USER=dokploy
 POSTGRES_DB=dokploy
 POSTGRES_PASSWORD=${pg_password}
 DATABASE_URL=postgresql://dokploy:${pg_password}@postgres:5432/dokploy
 
 # Redis
-REDIS_VERSION=${REDIS_VERSION}
 REDIS_URL=redis://redis:6379
 
 # Traefik
-TRAEFIK_VERSION=${TRAEFIK_VERSION}
 SKIP_TRAEFIK=${SKIP_TRAEFIK:-false}
 EOF
 
@@ -478,7 +474,8 @@ generate_docker_compose() {
 
     log INFO "Generating docker-compose.yml..."
 
-    cat > "$compose_file" << 'EOF'
+    # Note: Using mixed heredoc - unquoted EOF allows variable expansion for hardcoded values
+    cat > "$compose_file" << EOF
 # =============================================================================
 # Dokploy Enhanced - Docker Compose Configuration
 # =============================================================================
@@ -492,21 +489,21 @@ services:
   # Dokploy - Main Application
   # ===========================================================================
   dokploy:
-    image: ${DOKPLOY_REGISTRY}/${DOKPLOY_IMAGE}:${DOKPLOY_VERSION}
+    image: \${DOKPLOY_REGISTRY}/\${DOKPLOY_IMAGE}:\${DOKPLOY_VERSION}
     container_name: dokploy
     restart: unless-stopped
     networks:
       - dokploy-network
     ports:
-      - "${DOKPLOY_PORT}:3000"
+      - "\${DOKPLOY_PORT}:3000"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-      - ${DATA_DIR}:/etc/dokploy
+      - \${DATA_DIR}:/etc/dokploy
       - dokploy-docker:/root/.docker
     environment:
-      - ADVERTISE_ADDR=${ADVERTISE_ADDR}
-      - DATABASE_URL=${DATABASE_URL}
-      - REDIS_URL=${REDIS_URL}
+      - ADVERTISE_ADDR=\${ADVERTISE_ADDR}
+      - DATABASE_URL=\${DATABASE_URL}
+      - REDIS_URL=\${REDIS_URL}
     depends_on:
       - postgres
       - redis
@@ -529,11 +526,11 @@ services:
     volumes:
       - dokploy-postgres:/var/lib/postgresql/data
     environment:
-      - POSTGRES_USER=${POSTGRES_USER}
-      - POSTGRES_DB=${POSTGRES_DB}
-      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_USER=\${POSTGRES_USER}
+      - POSTGRES_DB=\${POSTGRES_DB}
+      - POSTGRES_PASSWORD=\${POSTGRES_PASSWORD}
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      test: ["CMD-SHELL", "pg_isready -U \${POSTGRES_USER} -d \${POSTGRES_DB}"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -572,9 +569,9 @@ services:
       - "443:443/udp"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
-      - ${DATA_DIR}/traefik/traefik.yml:/etc/traefik/traefik.yml:ro
-      - ${DATA_DIR}/traefik/dynamic:/etc/traefik/dynamic:ro
-      - ${DATA_DIR}/traefik/acme:/etc/traefik/acme
+      - \${DATA_DIR}/traefik/traefik.yml:/etc/traefik/traefik.yml:ro
+      - \${DATA_DIR}/traefik/dynamic:/etc/traefik/dynamic:ro
+      - \${DATA_DIR}/traefik/acme:/etc/traefik/acme
 
 # =============================================================================
 # Networks
