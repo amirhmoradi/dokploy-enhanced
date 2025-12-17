@@ -214,6 +214,50 @@ select_deploy_mode() {
     esac
 }
 
+select_traefik_option() {
+    local traefik="${TRAEFIK_ENABLED:-}"
+
+    # If already set via environment variable, use it
+    if [[ -n "$traefik" ]]; then
+        if [[ "$traefik" != "true" && "$traefik" != "false" ]]; then
+            die "Invalid TRAEFIK_ENABLED: $traefik. Must be 'true' or 'false'."
+        fi
+        echo "$traefik"
+        return 0
+    fi
+
+    # If force mode, use default (true)
+    if [[ "${FORCE:-false}" == "true" ]]; then
+        echo "true"
+        return 0
+    fi
+
+    echo "" >&2
+    printf "${CYAN}Include Traefik reverse proxy?${NC}\n" >&2
+    echo "" >&2
+    printf "  ${CYAN}1)${NC} Yes - Include Traefik for SSL termination and routing (recommended)\n" >&2
+    printf "  ${CYAN}2)${NC} No  - Skip Traefik (use your own reverse proxy)\n" >&2
+    echo "" >&2
+
+    local choice
+    printf "Enter choice [1-2] (default: 1): " >&2
+    read -r choice < /dev/tty || choice=""
+    choice=${choice:-1}
+
+    case "$choice" in
+        1|yes|y|true)
+            echo "true"
+            ;;
+        2|no|n|false)
+            echo "false"
+            ;;
+        *)
+            log WARN "Invalid choice. Including Traefik."
+            echo "true"
+            ;;
+    esac
+}
+
 command_exists() {
     command -v "$1" >/dev/null 2>&1
 }
@@ -415,6 +459,7 @@ generate_env_file() {
     local advertise_addr="$2"
     local pg_password="$3"
     local deploy_mode="$4"
+    local traefik_enabled="${5:-true}"
     local env_file="$data_dir/.env"
 
     # Check for existing file
@@ -455,8 +500,8 @@ DATABASE_URL=postgresql://dokploy:${pg_password}@postgres:5432/dokploy
 # Redis
 REDIS_URL=redis://redis:6379
 
-# Traefik
-SKIP_TRAEFIK=${SKIP_TRAEFIK:-false}
+# Traefik (true/false)
+TRAEFIK_ENABLED=${traefik_enabled}
 EOF
 
     chmod 600 "$env_file"
@@ -465,6 +510,7 @@ EOF
 
 generate_docker_compose() {
     local data_dir="$1"
+    local traefik_enabled="${2:-true}"
     local compose_file="$data_dir/docker-compose.yml"
 
     # Check for existing file
@@ -552,9 +598,14 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+EOF
+
+    # Conditionally add Traefik service
+    if [[ "$traefik_enabled" == "true" ]]; then
+        cat >> "$compose_file" << EOF
 
   # ===========================================================================
-  # Traefik - Reverse Proxy (Optional)
+  # Traefik - Reverse Proxy
   # ===========================================================================
   traefik:
     image: traefik:${TRAEFIK_VERSION}
@@ -571,6 +622,17 @@ services:
       - \${DATA_DIR}/traefik/traefik.yml:/etc/traefik/traefik.yml:ro
       - \${DATA_DIR}/traefik/dynamic:/etc/traefik/dynamic:ro
       - \${DATA_DIR}/traefik/acme:/etc/traefik/acme
+    deploy:
+      mode: replicated
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+EOF
+    fi
+
+    # Add networks and volumes sections
+    cat >> "$compose_file" << EOF
 
 # =============================================================================
 # Networks
@@ -790,6 +852,11 @@ cmd_install() {
     deploy_mode=$(select_deploy_mode)
     log INFO "Deployment mode: $deploy_mode"
 
+    # Select traefik option
+    local traefik_enabled
+    traefik_enabled=$(select_traefik_option)
+    log INFO "Traefik enabled: $traefik_enabled"
+
     # Install Docker and Docker Compose
     install_docker
     install_docker_compose
@@ -811,9 +878,13 @@ cmd_install() {
     local pg_password="${POSTGRES_PASSWORD:-$(generate_password)}"
 
     # Generate configuration files
-    generate_env_file "$data_dir" "$advertise_addr" "$pg_password" "$deploy_mode"
-    generate_docker_compose "$data_dir"
-    generate_traefik_config "$data_dir"
+    generate_env_file "$data_dir" "$advertise_addr" "$pg_password" "$deploy_mode" "$traefik_enabled"
+    generate_docker_compose "$data_dir" "$traefik_enabled"
+
+    # Generate Traefik config only if enabled
+    if [[ "$traefik_enabled" == "true" ]]; then
+        generate_traefik_config "$data_dir"
+    fi
 
     # Start services using the appropriate method for deploy mode
     services_up
@@ -1473,9 +1544,12 @@ EOF
 
     # Migration uses standalone mode by default (can be changed after migration)
     local deploy_mode="${DEPLOY_MODE:-standalone}"
-    generate_env_file "$data_dir" "$advertise_addr" "$pg_password" "$deploy_mode"
-    generate_docker_compose "$data_dir"
-    generate_traefik_config "$data_dir"
+    local traefik_enabled="${TRAEFIK_ENABLED:-true}"
+    generate_env_file "$data_dir" "$advertise_addr" "$pg_password" "$deploy_mode" "$traefik_enabled"
+    generate_docker_compose "$data_dir" "$traefik_enabled"
+    if [[ "$traefik_enabled" == "true" ]]; then
+        generate_traefik_config "$data_dir"
+    fi
 
     # Start services
     services_up
