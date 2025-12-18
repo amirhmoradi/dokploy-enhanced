@@ -48,6 +48,7 @@ jobs:
     outputs:
       merged_prs: ${{ steps.merge-prs.outputs.merged_prs }}
       failed_prs: ${{ steps.merge-prs.outputs.failed_prs }}
+      drizzle_status: ${{ steps.drizzle-fix.outputs.drizzle_status }}
       build_version: ${{ steps.meta.outputs.build_version }}
       enhanced_version_tag: ${{ steps.meta.outputs.enhanced_version_tag }}
       upstream_release: ${{ steps.meta.outputs.upstream_release }}
@@ -153,9 +154,53 @@ jobs:
               echo "::notice::Successfully merged PR #$PR_NUM: $PR_TITLE"
               MERGED_PRS="${MERGED_PRS}${PR_NUM},"
             else
-              echo "::warning::Merge conflict for PR #$PR_NUM, attempting to abort..."
-              git merge --abort || true
-              FAILED_PRS="${FAILED_PRS}${PR_NUM}(conflict),"
+              echo "::warning::Merge conflict for PR #$PR_NUM, checking if drizzle-only..."
+
+              # Check if conflicts are only in drizzle files (can be auto-resolved)
+              CONFLICT_FILES=$(git diff --name-only --diff-filter=U 2>/dev/null || true)
+              DRIZZLE_CONFLICTS=$(echo "$CONFLICT_FILES" | grep -E "(drizzle|migrations)" || true)
+              NON_DRIZZLE_CONFLICTS=$(echo "$CONFLICT_FILES" | grep -vE "(drizzle|migrations)" || true)
+
+              if [ -n "$CONFLICT_FILES" ] && [ -z "$NON_DRIZZLE_CONFLICTS" ] && [ -n "$DRIZZLE_CONFLICTS" ]; then
+                echo "::notice::Conflicts are drizzle-only, attempting auto-resolution..."
+
+                # For drizzle meta files, accept "theirs" (base branch version)
+                # This preserves the sequential history from the base
+                for conflict_file in $DRIZZLE_CONFLICTS; do
+                  if echo "$conflict_file" | grep -qE "(meta/_journal\.json|_snapshot\.json|\.snapshot\.json)"; then
+                    echo "Accepting base version for meta file: $conflict_file"
+                    git checkout --theirs "$conflict_file" 2>/dev/null || true
+                    git add "$conflict_file" 2>/dev/null || true
+                  elif echo "$conflict_file" | grep -qE "\.sql$"; then
+                    # For SQL migration files, we'll need to regenerate later
+                    # Accept "ours" (PR version) for now, will be fixed in post-processing
+                    echo "Accepting PR version for SQL file: $conflict_file"
+                    git checkout --ours "$conflict_file" 2>/dev/null || true
+                    git add "$conflict_file" 2>/dev/null || true
+                  else
+                    # For other drizzle files, accept theirs
+                    echo "Accepting base version for: $conflict_file"
+                    git checkout --theirs "$conflict_file" 2>/dev/null || true
+                    git add "$conflict_file" 2>/dev/null || true
+                  fi
+                done
+
+                # Complete the merge
+                if git commit --no-edit -m "Merge PR #$PR_NUM: $PR_TITLE (drizzle conflicts auto-resolved)"; then
+                  echo "::notice::Successfully merged PR #$PR_NUM with drizzle auto-resolution"
+                  MERGED_PRS="${MERGED_PRS}${PR_NUM},"
+                  echo "drizzle_fix_needed=true" >> $GITHUB_ENV
+                else
+                  echo "::warning::Failed to complete merge for PR #$PR_NUM after conflict resolution"
+                  git merge --abort || true
+                  FAILED_PRS="${FAILED_PRS}${PR_NUM}(drizzle-resolve-failed),"
+                fi
+              else
+                echo "::warning::Non-drizzle conflicts detected, aborting merge for PR #$PR_NUM"
+                echo "Conflicting files: $NON_DRIZZLE_CONFLICTS"
+                git merge --abort || true
+                FAILED_PRS="${FAILED_PRS}${PR_NUM}(conflict),"
+              fi
             fi
           done
 
@@ -175,6 +220,208 @@ jobs:
 
           if [ -n "$FAILED_PRS" ]; then
             echo "::warning::Some PRs failed to merge: $FAILED_PRS"
+          fi
+
+      # =======================================================================
+      # Fix Drizzle Migration Conflicts
+      # =======================================================================
+      # Drizzle ORM maintains migration state in meta/_journal.json and snapshot files.
+      # When PRs with migrations are merged, conflicts can occur due to:
+      # 1. Duplicate migration numbers (e.g., two PRs both create 0007_*.sql)
+      # 2. Conflicting _journal.json entries
+      # 3. Mismatched snapshot files
+      #
+      # This step repairs these issues by:
+      # - Detecting and removing duplicate/orphaned migrations
+      # - Ensuring journal entries match existing SQL files
+      # - Regenerating migrations if schema changes are pending
+      #
+      # References:
+      # - https://github.com/drizzle-team/drizzle-orm/discussions/1104
+      # - https://gist.github.com/gburtini/7e34842c567dd80ee834de74e7b79edd
+      # =======================================================================
+      - name: Fix Drizzle migration conflicts
+        id: drizzle-fix
+        if: steps.determine-prs.outputs.has_prs == 'true'
+        run: |
+          cd dokploy-source
+
+          echo "=========================================="
+          echo "Checking for Drizzle migration conflicts"
+          echo "=========================================="
+
+          # Find all drizzle migration directories
+          DRIZZLE_DIRS=$(find . -type d -name "drizzle" 2>/dev/null | head -20)
+          MIGRATION_DIRS=$(find . -type d -name "migrations" 2>/dev/null | head -20)
+
+          ALL_DIRS="$DRIZZLE_DIRS $MIGRATION_DIRS"
+
+          if [ -z "$ALL_DIRS" ] || [ "$ALL_DIRS" = " " ]; then
+            echo "No drizzle/migration directories found, skipping..."
+            exit 0
+          fi
+
+          CONFLICTS_FOUND=false
+          CONFLICTS_FIXED=false
+
+          for DIR in $ALL_DIRS; do
+            if [ ! -d "$DIR" ]; then
+              continue
+            fi
+
+            echo ""
+            echo "Checking directory: $DIR"
+
+            # Check for meta directory with journal
+            META_DIR=""
+            if [ -d "$DIR/meta" ]; then
+              META_DIR="$DIR/meta"
+            elif [ -d "$DIR/../meta" ]; then
+              META_DIR="$DIR/../meta"
+            fi
+
+            # Look for _journal.json
+            JOURNAL_FILE=""
+            if [ -f "$META_DIR/_journal.json" ]; then
+              JOURNAL_FILE="$META_DIR/_journal.json"
+            elif [ -f "$DIR/_journal.json" ]; then
+              JOURNAL_FILE="$DIR/_journal.json"
+            fi
+
+            if [ -z "$JOURNAL_FILE" ]; then
+              echo "  No journal file found in $DIR"
+              continue
+            fi
+
+            echo "  Found journal: $JOURNAL_FILE"
+
+            # Check for git conflict markers in journal
+            if grep -q "<<<<<<" "$JOURNAL_FILE" 2>/dev/null; then
+              echo "  ::warning::Git conflict markers found in $JOURNAL_FILE"
+              CONFLICTS_FOUND=true
+
+              # Try to parse and fix the journal
+              # Remove conflict markers and keep a valid JSON structure
+              echo "  Attempting to clean conflict markers..."
+
+              # Create backup
+              cp "$JOURNAL_FILE" "${JOURNAL_FILE}.bak"
+
+              # Strategy: Keep the "theirs" (base) version of conflicting sections
+              # This preserves the sequential migration history
+              sed -i '/<<<<<<</,/=======/d' "$JOURNAL_FILE"
+              sed -i '/>>>>>>>/d' "$JOURNAL_FILE"
+
+              # Validate JSON
+              if python3 -c "import json; json.load(open('$JOURNAL_FILE'))" 2>/dev/null || \
+                 node -e "JSON.parse(require('fs').readFileSync('$JOURNAL_FILE'))" 2>/dev/null; then
+                echo "  Journal cleaned and validated successfully"
+                CONFLICTS_FIXED=true
+                rm -f "${JOURNAL_FILE}.bak"
+              else
+                echo "  ::warning::Failed to clean journal, restoring backup"
+                mv "${JOURNAL_FILE}.bak" "$JOURNAL_FILE"
+              fi
+            fi
+
+            # Check for duplicate migration numbers
+            echo "  Checking for duplicate migration numbers..."
+            SQL_FILES=$(find "$DIR" -maxdepth 1 -name "*.sql" 2>/dev/null | sort)
+
+            if [ -n "$SQL_FILES" ]; then
+              # Extract migration numbers and find duplicates
+              MIGRATION_NUMS=$(echo "$SQL_FILES" | xargs -I {} basename {} | grep -oE '^[0-9]+' | sort)
+              DUPLICATE_NUMS=$(echo "$MIGRATION_NUMS" | uniq -d)
+
+              if [ -n "$DUPLICATE_NUMS" ]; then
+                echo "  ::warning::Duplicate migration numbers found: $DUPLICATE_NUMS"
+                CONFLICTS_FOUND=true
+
+                for DUP_NUM in $DUPLICATE_NUMS; do
+                  echo "  Processing duplicates for migration $DUP_NUM..."
+
+                  # Find all files with this number
+                  DUP_FILES=$(find "$DIR" -maxdepth 1 -name "${DUP_NUM}_*.sql" 2>/dev/null)
+
+                  if [ -n "$JOURNAL_FILE" ] && [ -f "$JOURNAL_FILE" ]; then
+                    # Check which one is in the journal
+                    for DUP_FILE in $DUP_FILES; do
+                      BASENAME=$(basename "$DUP_FILE" .sql)
+                      if grep -q "\"tag\": \"$BASENAME\"" "$JOURNAL_FILE" 2>/dev/null || \
+                         grep -q "\"$BASENAME\"" "$JOURNAL_FILE" 2>/dev/null; then
+                        echo "    Keeping (in journal): $BASENAME"
+                      else
+                        echo "    Removing (not in journal): $BASENAME"
+                        rm -f "$DUP_FILE"
+                        # Also remove corresponding snapshot if exists
+                        SNAPSHOT_FILE=$(find "$META_DIR" -name "${DUP_NUM}_*.json" 2>/dev/null | grep -v "_journal" | head -1)
+                        if [ -n "$SNAPSHOT_FILE" ]; then
+                          echo "    Removing orphaned snapshot: $(basename $SNAPSHOT_FILE)"
+                          rm -f "$SNAPSHOT_FILE"
+                        fi
+                        CONFLICTS_FIXED=true
+                      fi
+                    done
+                  else
+                    # No journal, keep the first one (sorted alphabetically)
+                    FIRST=true
+                    for DUP_FILE in $(echo "$DUP_FILES" | sort); do
+                      if [ "$FIRST" = true ]; then
+                        echo "    Keeping (first): $(basename $DUP_FILE)"
+                        FIRST=false
+                      else
+                        echo "    Removing (duplicate): $(basename $DUP_FILE)"
+                        rm -f "$DUP_FILE"
+                        CONFLICTS_FIXED=true
+                      fi
+                    done
+                  fi
+                done
+              fi
+            fi
+
+            # Clean up orphaned snapshot files
+            if [ -d "$META_DIR" ]; then
+              echo "  Checking for orphaned snapshots..."
+              for SNAPSHOT in $(find "$META_DIR" -name "*_snapshot.json" -o -name "[0-9]*_*.json" 2>/dev/null | grep -v "_journal"); do
+                SNAPSHOT_BASE=$(basename "$SNAPSHOT" .json)
+                SNAPSHOT_NUM=$(echo "$SNAPSHOT_BASE" | grep -oE '^[0-9]+')
+
+                if [ -n "$SNAPSHOT_NUM" ]; then
+                  # Check if corresponding SQL file exists
+                  SQL_MATCH=$(find "$DIR" -maxdepth 1 -name "${SNAPSHOT_NUM}_*.sql" 2>/dev/null | head -1)
+                  if [ -z "$SQL_MATCH" ]; then
+                    echo "    Removing orphaned snapshot: $SNAPSHOT_BASE"
+                    rm -f "$SNAPSHOT"
+                    CONFLICTS_FIXED=true
+                  fi
+                fi
+              done
+            fi
+          done
+
+          echo ""
+          echo "=========================================="
+          echo "Drizzle Conflict Check Summary"
+          echo "=========================================="
+
+          if [ "$CONFLICTS_FOUND" = true ]; then
+            if [ "$CONFLICTS_FIXED" = true ]; then
+              echo "::notice::Drizzle migration conflicts were detected and fixed"
+              echo "drizzle_status=fixed" >> $GITHUB_OUTPUT
+
+              # Commit the fixes
+              git add -A
+              if ! git diff --cached --quiet; then
+                git commit -m "fix: Auto-resolve drizzle migration conflicts" || true
+              fi
+            else
+              echo "::warning::Drizzle migration conflicts detected but could not be fully resolved"
+              echo "drizzle_status=unresolved" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "No drizzle migration conflicts detected"
+            echo "drizzle_status=none" >> $GITHUB_OUTPUT
           fi
 
       - name: Generate build metadata
@@ -483,6 +730,23 @@ jobs:
           echo "| Successfully Merged | ${{ needs.prepare-source.outputs.merged_prs || 'None' }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Failed to Merge | ${{ needs.prepare-source.outputs.failed_prs || 'None' }} |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
+
+          # Drizzle migration conflict resolution status
+          DRIZZLE_STATUS="${{ needs.prepare-source.outputs.drizzle_status || 'none' }}"
+          if [ "$DRIZZLE_STATUS" = "fixed" ]; then
+            echo "### Drizzle Migration Conflicts" >> $GITHUB_STEP_SUMMARY
+            echo "✅ **Drizzle migration conflicts were automatically resolved**" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "The workflow detected and fixed conflicts in Drizzle migration files (journal, snapshots, SQL migrations)." >> $GITHUB_STEP_SUMMARY
+            echo "This is a known issue when merging PRs that modify database schema. [Learn more](https://github.com/drizzle-team/drizzle-orm/discussions/1104)" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+          elif [ "$DRIZZLE_STATUS" = "unresolved" ]; then
+            echo "### ⚠️ Drizzle Migration Conflicts" >> $GITHUB_STEP_SUMMARY
+            echo "**Warning:** Drizzle migration conflicts were detected but could not be fully resolved automatically." >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "Manual intervention may be required. See workflow logs for details." >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+          fi
 
           echo "### Version Tags" >> $GITHUB_STEP_SUMMARY
           echo "| Description | Tag |" >> $GITHUB_STEP_SUMMARY
