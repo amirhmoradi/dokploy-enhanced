@@ -183,104 +183,13 @@ jobs:
                     git show :2:"$conflict_file" > /tmp/theirs_journal.json 2>/dev/null || echo '{"entries":[]}' > /tmp/theirs_journal.json
                     git show :3:"$conflict_file" > /tmp/ours_journal.json 2>/dev/null || echo '{"entries":[]}' > /tmp/ours_journal.json
 
-                    # Find the highest index in base (theirs) journal
-                    BASE_MAX_IDX=$(python3 -c "
-import json
-try:
-    with open('/tmp/theirs_journal.json') as f:
-        data = json.load(f)
-    entries = data.get('entries', [])
-    if entries:
-        print(max(e.get('idx', 0) for e in entries))
-    else:
-        print(-1)
-except:
-    print(-1)
-" 2>/dev/null || echo "-1")
+                    # Find the highest index in base (theirs) journal using inline Python
+                    BASE_MAX_IDX=$(python3 -c "import json; data=json.load(open('/tmp/theirs_journal.json')); entries=data.get('entries',[]); print(max((e.get('idx',0) for e in entries), default=-1) if entries else -1)" 2>/dev/null || echo "-1")
 
                     echo "  Base journal max index: $BASE_MAX_IDX"
 
-                    # Find PR-specific entries (entries in ours but not in theirs)
-                    # and renumber them to continue after base
-                    python3 << 'PYEOF'
-import json
-import os
-import glob
-import shutil
-
-try:
-    with open('/tmp/theirs_journal.json') as f:
-        theirs = json.load(f)
-    with open('/tmp/ours_journal.json') as f:
-        ours = json.load(f)
-except Exception as e:
-    print(f"Error loading journals: {e}")
-    exit(1)
-
-theirs_entries = theirs.get('entries', [])
-ours_entries = ours.get('entries', [])
-
-# Find the highest index in theirs
-base_max_idx = max((e.get('idx', 0) for e in theirs_entries), default=-1)
-
-# Get tags from theirs to identify what's already in base
-theirs_tags = {e.get('tag') for e in theirs_entries}
-
-# Find entries unique to ours (PR's new migrations)
-pr_entries = [e for e in ours_entries if e.get('tag') not in theirs_tags]
-
-if pr_entries:
-    print(f"Found {len(pr_entries)} PR-specific migration(s) to renumber")
-
-    # Create mapping for renumbering
-    drizzle_dir = os.environ.get('DRIZZLE_DIR', '.')
-    rename_map = {}
-
-    for i, entry in enumerate(pr_entries):
-        old_idx = entry.get('idx', 0)
-        new_idx = base_max_idx + 1 + i
-        old_tag = entry.get('tag', '')
-
-        # Parse old tag to get the name part (after the number prefix)
-        if '_' in old_tag:
-            name_part = '_'.join(old_tag.split('_')[1:])
-        else:
-            name_part = old_tag
-
-        # Create new tag with new index
-        new_tag = f"{new_idx:04d}_{name_part}"
-
-        print(f"  Renumbering: {old_tag} -> {new_tag}")
-
-        # Update entry
-        entry['idx'] = new_idx
-        entry['tag'] = new_tag
-
-        # Track file renames needed
-        rename_map[old_tag] = new_tag
-
-    # Write the rename map for shell script to use
-    with open('/tmp/drizzle_rename_map.txt', 'w') as f:
-        for old, new in rename_map.items():
-            f.write(f"{old}|{new}\n")
-
-    # Merge entries: theirs + renumbered PR entries
-    merged_entries = theirs_entries + pr_entries
-    merged_entries.sort(key=lambda x: x.get('idx', 0))
-
-    # Write merged journal
-    merged = {'version': theirs.get('version', '7'), 'dialect': theirs.get('dialect', 'postgresql'), 'entries': merged_entries}
-    with open('/tmp/merged_journal.json', 'w') as f:
-        json.dump(merged, f, indent=2)
-
-    print("Merged journal created successfully")
-else:
-    print("No PR-specific migrations found, using base journal")
-    shutil.copy('/tmp/theirs_journal.json', '/tmp/merged_journal.json')
-    with open('/tmp/drizzle_rename_map.txt', 'w') as f:
-        pass  # Empty file
-
-PYEOF
+                    # Find PR-specific entries and renumber them to continue after base
+                    python3 ../.github/scripts/merge_drizzle_journals.py
 
                     # Check if python script succeeded
                     if [ $? -eq 0 ] && [ -f /tmp/merged_journal.json ]; then
@@ -492,121 +401,7 @@ PYEOF
                 export META_DIR="$META_DIR"
                 export JOURNAL_FILE="$JOURNAL_FILE"
 
-                python3 << 'PYEOF'
-import json
-import os
-import re
-import shutil
-
-drizzle_dir = os.environ.get('DRIZZLE_DIR', '.')
-meta_dir = os.environ.get('META_DIR', '')
-journal_file = os.environ.get('JOURNAL_FILE', '')
-
-# Load journal
-try:
-    with open(journal_file) as f:
-        journal = json.load(f)
-except Exception as e:
-    print(f"  Error loading journal: {e}")
-    exit(1)
-
-entries = journal.get('entries', [])
-journal_tags = {e.get('tag') for e in entries}
-
-# Find all SQL files
-sql_files = []
-for f in os.listdir(drizzle_dir):
-    if f.endswith('.sql'):
-        sql_files.append(f)
-sql_files.sort()
-
-# Group by migration number
-from collections import defaultdict
-by_number = defaultdict(list)
-for sql_file in sql_files:
-    match = re.match(r'^(\d+)_(.+)\.sql$', sql_file)
-    if match:
-        num = int(match.group(1))
-        name = match.group(2)
-        tag = sql_file[:-4]  # Remove .sql
-        by_number[num].append({'file': sql_file, 'tag': tag, 'name': name, 'num': num})
-
-# Find the highest number currently in use
-max_num = max(by_number.keys()) if by_number else -1
-
-# Process duplicates - renumber files not in journal
-changes_made = False
-new_entries = []
-
-for num in sorted(by_number.keys()):
-    files = by_number[num]
-    if len(files) > 1:
-        print(f"  Processing {len(files)} files with number {num:04d}")
-        for i, file_info in enumerate(files):
-            if file_info['tag'] in journal_tags:
-                print(f"    Keeping (in journal): {file_info['file']}")
-            else:
-                # Renumber this file
-                max_num += 1
-                new_tag = f"{max_num:04d}_{file_info['name']}"
-                new_file = f"{new_tag}.sql"
-                old_path = os.path.join(drizzle_dir, file_info['file'])
-                new_path = os.path.join(drizzle_dir, new_file)
-
-                print(f"    Renumbering: {file_info['file']} -> {new_file}")
-
-                # Rename SQL file
-                shutil.move(old_path, new_path)
-
-                # Rename snapshot if exists
-                if meta_dir:
-                    old_snapshot = os.path.join(meta_dir, f"{file_info['tag']}.json")
-                    new_snapshot = os.path.join(meta_dir, f"{new_tag}.json")
-                    if os.path.exists(old_snapshot):
-                        shutil.move(old_snapshot, new_snapshot)
-                        print(f"    Renamed snapshot: {file_info['tag']}.json -> {new_tag}.json")
-
-                # Add new entry to journal
-                # Find the original entry to copy metadata
-                original_entry = None
-                for e in entries:
-                    if e.get('tag') == file_info['tag']:
-                        original_entry = e.copy()
-                        break
-
-                if original_entry:
-                    original_entry['idx'] = max_num
-                    original_entry['tag'] = new_tag
-                else:
-                    # Create new entry
-                    original_entry = {
-                        'idx': max_num,
-                        'version': '7',
-                        'when': int(os.path.getmtime(new_path) * 1000),
-                        'tag': new_tag,
-                        'breakpoints': True
-                    }
-
-                new_entries.append(original_entry)
-                changes_made = True
-
-# Add new entries to journal
-if new_entries:
-    entries.extend(new_entries)
-    entries.sort(key=lambda x: x.get('idx', 0))
-    journal['entries'] = entries
-
-    with open(journal_file, 'w') as f:
-        json.dump(journal, f, indent=2)
-
-    print(f"  Added {len(new_entries)} renumbered migration(s) to journal")
-
-if changes_made:
-    print("  Migrations renumbered successfully - all migrations preserved")
-else:
-    print("  No renumbering needed")
-
-PYEOF
+                python3 ../.github/scripts/renumber_drizzle_migrations.py
 
                 if [ $? -eq 0 ]; then
                   ISSUES_FIXED=true
@@ -629,39 +424,7 @@ PYEOF
 
             # Validate: Check for orphaned journal entries (entries without SQL files)
             echo "  Checking journal integrity..."
-            python3 << 'PYEOF' || true
-import json
-import os
-
-journal_file = os.environ.get('JOURNAL_FILE', '')
-drizzle_dir = os.environ.get('DRIZZLE_DIR', '.')
-
-try:
-    with open(journal_file) as f:
-        journal = json.load(f)
-except:
-    exit(0)
-
-entries = journal.get('entries', [])
-valid_entries = []
-removed = 0
-
-for entry in entries:
-    tag = entry.get('tag', '')
-    sql_path = os.path.join(drizzle_dir, f"{tag}.sql")
-    if os.path.exists(sql_path):
-        valid_entries.append(entry)
-    else:
-        print(f"    Removing orphaned journal entry: {tag}")
-        removed += 1
-
-if removed > 0:
-    journal['entries'] = valid_entries
-    with open(journal_file, 'w') as f:
-        json.dump(journal, f, indent=2)
-    print(f"  Removed {removed} orphaned journal entries")
-
-PYEOF
+            python3 ../.github/scripts/cleanup_drizzle_journal.py || true
 
           done
 
