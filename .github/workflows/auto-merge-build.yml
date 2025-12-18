@@ -142,27 +142,80 @@ jobs:
 
             # Fetch the PR's commits
             echo "Fetching PR #$PR_NUM from $PR_HEAD_REPO..."
-            git fetch "https://github.com/$PR_HEAD_REPO.git" "$PR_HEAD_REF" || {
+            git fetch "https://github.com/$PR_HEAD_REPO.git" "$PR_HEAD_REF":refs/remotes/pr/$PR_NUM || {
               echo "::warning::Failed to fetch PR #$PR_NUM"
               FAILED_PRS="${FAILED_PRS}${PR_NUM}(fetch failed),"
               continue
             }
 
-            # Try to merge the PR
-            echo "Merging PR #$PR_NUM..."
-            if git merge --no-edit "$PR_HEAD_SHA" -m "Merge PR #$PR_NUM: $PR_TITLE"; then
+            # ================================================================
+            # Merge Strategy (inspired by Graphite's stacked PR handling)
+            # ================================================================
+            # 1. Try direct merge first
+            # 2. If conflicts, try rebasing PR onto current HEAD (lazy rebase)
+            # 3. If still conflicts, check if drizzle-only and auto-resolve
+            # 4. Otherwise fail the PR
+            # Reference: https://graphite.com/guides/how-to-merge-stack-pull-requests-github
+            # ================================================================
+
+            CURRENT_HEAD=$(git rev-parse HEAD)
+            MERGE_SUCCEEDED=false
+
+            # Step 1: Try direct merge
+            echo "Attempting direct merge of PR #$PR_NUM..."
+            if git merge --no-edit "pr/$PR_NUM" -m "Merge PR #$PR_NUM: $PR_TITLE"; then
               echo "::notice::Successfully merged PR #$PR_NUM: $PR_TITLE"
               MERGED_PRS="${MERGED_PRS}${PR_NUM},"
+              MERGE_SUCCEEDED=true
             else
-              echo "::warning::Merge conflict for PR #$PR_NUM, checking if drizzle-only..."
+              echo "::warning::Direct merge failed for PR #$PR_NUM, trying lazy rebase strategy..."
+              git merge --abort 2>/dev/null || true
 
-              # Check if conflicts are only in drizzle files (can be auto-resolved)
-              CONFLICT_FILES=$(git diff --name-only --diff-filter=U 2>/dev/null || true)
-              DRIZZLE_CONFLICTS=$(echo "$CONFLICT_FILES" | grep -E "(drizzle|migrations)" || true)
-              NON_DRIZZLE_CONFLICTS=$(echo "$CONFLICT_FILES" | grep -vE "(drizzle|migrations)" || true)
+              # Step 2: Try rebasing PR onto current HEAD (lazy rebase)
+              # This helps when previous PRs in the stack have changed the base
+              echo "Creating temporary branch for rebase..."
+              git branch -D pr-rebase-temp 2>/dev/null || true
+              git checkout -b pr-rebase-temp "pr/$PR_NUM"
 
-              if [ -n "$CONFLICT_FILES" ] && [ -z "$NON_DRIZZLE_CONFLICTS" ] && [ -n "$DRIZZLE_CONFLICTS" ]; then
-                echo "::notice::Conflicts are drizzle-only, attempting auto-resolution with migration preservation..."
+              echo "Rebasing PR #$PR_NUM onto current HEAD..."
+              if git rebase "$CURRENT_HEAD" --strategy-option=theirs 2>/dev/null; then
+                echo "::notice::Rebase successful, attempting merge..."
+                git checkout -
+
+                if git merge --no-edit pr-rebase-temp -m "Merge PR #$PR_NUM: $PR_TITLE (rebased)"; then
+                  echo "::notice::Successfully merged PR #$PR_NUM after rebase"
+                  MERGED_PRS="${MERGED_PRS}${PR_NUM},"
+                  MERGE_SUCCEEDED=true
+                else
+                  echo "::warning::Merge still failed after rebase"
+                  git merge --abort 2>/dev/null || true
+                fi
+              else
+                echo "::warning::Rebase failed, checking for drizzle conflicts..."
+                git rebase --abort 2>/dev/null || true
+                git checkout - 2>/dev/null || git checkout "$CURRENT_HEAD"
+              fi
+
+              git branch -D pr-rebase-temp 2>/dev/null || true
+            fi
+
+            # Step 3: If merge still not succeeded, try drizzle-specific resolution
+            if [ "$MERGE_SUCCEEDED" = false ]; then
+              echo "Attempting merge with drizzle conflict resolution..."
+
+              if git merge --no-edit "pr/$PR_NUM" -m "Merge PR #$PR_NUM: $PR_TITLE" 2>/dev/null; then
+                # Merge succeeded on retry (rare but possible)
+                echo "::notice::Successfully merged PR #$PR_NUM: $PR_TITLE"
+                MERGED_PRS="${MERGED_PRS}${PR_NUM},"
+                MERGE_SUCCEEDED=true
+              else
+                # Check if conflicts are only in drizzle files (can be auto-resolved)
+                CONFLICT_FILES=$(git diff --name-only --diff-filter=U 2>/dev/null || true)
+                DRIZZLE_CONFLICTS=$(echo "$CONFLICT_FILES" | grep -E "(drizzle|migrations)" || true)
+                NON_DRIZZLE_CONFLICTS=$(echo "$CONFLICT_FILES" | grep -vE "(drizzle|migrations)" | grep -v "^$" || true)
+
+                if [ -n "$CONFLICT_FILES" ] && [ -z "$NON_DRIZZLE_CONFLICTS" ] && [ -n "$DRIZZLE_CONFLICTS" ]; then
+                  echo "::notice::Conflicts are drizzle-only, attempting auto-resolution with migration preservation..."
 
                 # Strategy: Preserve ALL migrations by renumbering PR's migrations after base's migrations
                 # 1. Extract base (theirs) journal to get highest migration index
@@ -252,21 +305,22 @@ jobs:
                 # Stage all changes
                 git add -A
 
-                # Complete the merge
-                if git commit --no-edit -m "Merge PR #$PR_NUM: $PR_TITLE (drizzle migrations preserved and renumbered)"; then
-                  echo "::notice::Successfully merged PR #$PR_NUM with all migrations preserved"
-                  MERGED_PRS="${MERGED_PRS}${PR_NUM},"
-                  echo "drizzle_fix_needed=true" >> $GITHUB_ENV
+                  # Complete the merge
+                  if git commit --no-edit -m "Merge PR #$PR_NUM: $PR_TITLE (drizzle migrations preserved and renumbered)"; then
+                    echo "::notice::Successfully merged PR #$PR_NUM with all migrations preserved"
+                    MERGED_PRS="${MERGED_PRS}${PR_NUM},"
+                    echo "drizzle_fix_needed=true" >> $GITHUB_ENV
+                  else
+                    echo "::warning::Failed to complete merge for PR #$PR_NUM after conflict resolution"
+                    git merge --abort || true
+                    FAILED_PRS="${FAILED_PRS}${PR_NUM}(drizzle-resolve-failed),"
+                  fi
                 else
-                  echo "::warning::Failed to complete merge for PR #$PR_NUM after conflict resolution"
+                  echo "::warning::Non-drizzle conflicts detected, aborting merge for PR #$PR_NUM"
+                  echo "Conflicting files: $NON_DRIZZLE_CONFLICTS"
                   git merge --abort || true
-                  FAILED_PRS="${FAILED_PRS}${PR_NUM}(drizzle-resolve-failed),"
+                  FAILED_PRS="${FAILED_PRS}${PR_NUM}(conflict),"
                 fi
-              else
-                echo "::warning::Non-drizzle conflicts detected, aborting merge for PR #$PR_NUM"
-                echo "Conflicting files: $NON_DRIZZLE_CONFLICTS"
-                git merge --abort || true
-                FAILED_PRS="${FAILED_PRS}${PR_NUM}(conflict),"
               fi
             fi
           done
