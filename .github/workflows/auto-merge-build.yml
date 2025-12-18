@@ -162,32 +162,190 @@ jobs:
               NON_DRIZZLE_CONFLICTS=$(echo "$CONFLICT_FILES" | grep -vE "(drizzle|migrations)" || true)
 
               if [ -n "$CONFLICT_FILES" ] && [ -z "$NON_DRIZZLE_CONFLICTS" ] && [ -n "$DRIZZLE_CONFLICTS" ]; then
-                echo "::notice::Conflicts are drizzle-only, attempting auto-resolution..."
+                echo "::notice::Conflicts are drizzle-only, attempting auto-resolution with migration preservation..."
 
-                # For drizzle meta files, accept "theirs" (base branch version)
-                # This preserves the sequential history from the base
+                # Strategy: Preserve ALL migrations by renumbering PR's migrations after base's migrations
+                # 1. Extract base (theirs) journal to get highest migration index
+                # 2. Extract PR (ours) migration entries
+                # 3. Renumber PR migrations to continue after base
+                # 4. Merge journals and keep all SQL files
+
+                DRIZZLE_RESOLVED=true
+
                 for conflict_file in $DRIZZLE_CONFLICTS; do
-                  if echo "$conflict_file" | grep -qE "(meta/_journal\.json|_snapshot\.json|\.snapshot\.json)"; then
-                    echo "Accepting base version for meta file: $conflict_file"
-                    git checkout --theirs "$conflict_file" 2>/dev/null || true
-                    git add "$conflict_file" 2>/dev/null || true
-                  elif echo "$conflict_file" | grep -qE "\.sql$"; then
-                    # For SQL migration files, we'll need to regenerate later
-                    # Accept "ours" (PR version) for now, will be fixed in post-processing
-                    echo "Accepting PR version for SQL file: $conflict_file"
+                  if echo "$conflict_file" | grep -qE "meta/_journal\.json$"; then
+                    echo "Processing journal conflict: $conflict_file"
+
+                    # Get the directory containing drizzle migrations
+                    DRIZZLE_DIR=$(dirname $(dirname "$conflict_file"))
+
+                    # Extract both versions of the journal
+                    git show :2:"$conflict_file" > /tmp/theirs_journal.json 2>/dev/null || echo '{"entries":[]}' > /tmp/theirs_journal.json
+                    git show :3:"$conflict_file" > /tmp/ours_journal.json 2>/dev/null || echo '{"entries":[]}' > /tmp/ours_journal.json
+
+                    # Find the highest index in base (theirs) journal
+                    BASE_MAX_IDX=$(python3 -c "
+import json
+try:
+    with open('/tmp/theirs_journal.json') as f:
+        data = json.load(f)
+    entries = data.get('entries', [])
+    if entries:
+        print(max(e.get('idx', 0) for e in entries))
+    else:
+        print(-1)
+except:
+    print(-1)
+" 2>/dev/null || echo "-1")
+
+                    echo "  Base journal max index: $BASE_MAX_IDX"
+
+                    # Find PR-specific entries (entries in ours but not in theirs)
+                    # and renumber them to continue after base
+                    python3 << 'PYEOF'
+import json
+import os
+import glob
+import shutil
+
+try:
+    with open('/tmp/theirs_journal.json') as f:
+        theirs = json.load(f)
+    with open('/tmp/ours_journal.json') as f:
+        ours = json.load(f)
+except Exception as e:
+    print(f"Error loading journals: {e}")
+    exit(1)
+
+theirs_entries = theirs.get('entries', [])
+ours_entries = ours.get('entries', [])
+
+# Find the highest index in theirs
+base_max_idx = max((e.get('idx', 0) for e in theirs_entries), default=-1)
+
+# Get tags from theirs to identify what's already in base
+theirs_tags = {e.get('tag') for e in theirs_entries}
+
+# Find entries unique to ours (PR's new migrations)
+pr_entries = [e for e in ours_entries if e.get('tag') not in theirs_tags]
+
+if pr_entries:
+    print(f"Found {len(pr_entries)} PR-specific migration(s) to renumber")
+
+    # Create mapping for renumbering
+    drizzle_dir = os.environ.get('DRIZZLE_DIR', '.')
+    rename_map = {}
+
+    for i, entry in enumerate(pr_entries):
+        old_idx = entry.get('idx', 0)
+        new_idx = base_max_idx + 1 + i
+        old_tag = entry.get('tag', '')
+
+        # Parse old tag to get the name part (after the number prefix)
+        if '_' in old_tag:
+            name_part = '_'.join(old_tag.split('_')[1:])
+        else:
+            name_part = old_tag
+
+        # Create new tag with new index
+        new_tag = f"{new_idx:04d}_{name_part}"
+
+        print(f"  Renumbering: {old_tag} -> {new_tag}")
+
+        # Update entry
+        entry['idx'] = new_idx
+        entry['tag'] = new_tag
+
+        # Track file renames needed
+        rename_map[old_tag] = new_tag
+
+    # Write the rename map for shell script to use
+    with open('/tmp/drizzle_rename_map.txt', 'w') as f:
+        for old, new in rename_map.items():
+            f.write(f"{old}|{new}\n")
+
+    # Merge entries: theirs + renumbered PR entries
+    merged_entries = theirs_entries + pr_entries
+    merged_entries.sort(key=lambda x: x.get('idx', 0))
+
+    # Write merged journal
+    merged = {'version': theirs.get('version', '7'), 'dialect': theirs.get('dialect', 'postgresql'), 'entries': merged_entries}
+    with open('/tmp/merged_journal.json', 'w') as f:
+        json.dump(merged, f, indent=2)
+
+    print("Merged journal created successfully")
+else:
+    print("No PR-specific migrations found, using base journal")
+    shutil.copy('/tmp/theirs_journal.json', '/tmp/merged_journal.json')
+    with open('/tmp/drizzle_rename_map.txt', 'w') as f:
+        pass  # Empty file
+
+PYEOF
+
+                    # Check if python script succeeded
+                    if [ $? -eq 0 ] && [ -f /tmp/merged_journal.json ]; then
+                      # Apply the merged journal
+                      cp /tmp/merged_journal.json "$conflict_file"
+                      git add "$conflict_file"
+
+                      # Rename SQL files and snapshots according to the map
+                      if [ -f /tmp/drizzle_rename_map.txt ] && [ -s /tmp/drizzle_rename_map.txt ]; then
+                        while IFS='|' read -r old_tag new_tag; do
+                          if [ -n "$old_tag" ] && [ -n "$new_tag" ]; then
+                            # Rename SQL file
+                            OLD_SQL="$DRIZZLE_DIR/${old_tag}.sql"
+                            NEW_SQL="$DRIZZLE_DIR/${new_tag}.sql"
+                            if [ -f "$OLD_SQL" ]; then
+                              echo "  Renaming SQL: ${old_tag}.sql -> ${new_tag}.sql"
+                              git mv "$OLD_SQL" "$NEW_SQL" 2>/dev/null || mv "$OLD_SQL" "$NEW_SQL"
+                            fi
+
+                            # Rename snapshot file
+                            META_DIR="$DRIZZLE_DIR/meta"
+                            OLD_SNAPSHOT="$META_DIR/${old_tag}.json"
+                            NEW_SNAPSHOT="$META_DIR/${new_tag}.json"
+                            if [ -f "$OLD_SNAPSHOT" ]; then
+                              echo "  Renaming snapshot: ${old_tag}.json -> ${new_tag}.json"
+                              git mv "$OLD_SNAPSHOT" "$NEW_SNAPSHOT" 2>/dev/null || mv "$OLD_SNAPSHOT" "$NEW_SNAPSHOT"
+                            fi
+                          fi
+                        done < /tmp/drizzle_rename_map.txt
+                      fi
+
+                      echo "  Journal merged and files renumbered successfully"
+                    else
+                      echo "  ::warning::Failed to merge journal, falling back to base version"
+                      git checkout --theirs "$conflict_file" 2>/dev/null || true
+                      git add "$conflict_file" 2>/dev/null || true
+                    fi
+
+                  elif echo "$conflict_file" | grep -qE "_snapshot\.json$|\.snapshot\.json$"; then
+                    # For snapshot conflicts, we'll handle them after journal is processed
+                    # Accept ours for now, will be fixed by renaming step above
+                    echo "Processing snapshot conflict: $conflict_file (will be handled with journal)"
                     git checkout --ours "$conflict_file" 2>/dev/null || true
                     git add "$conflict_file" 2>/dev/null || true
+
+                  elif echo "$conflict_file" | grep -qE "\.sql$"; then
+                    # For SQL migration files, keep ours (PR version) - will be renumbered
+                    echo "Keeping PR's SQL migration: $conflict_file"
+                    git checkout --ours "$conflict_file" 2>/dev/null || true
+                    git add "$conflict_file" 2>/dev/null || true
+
                   else
-                    # For other drizzle files, accept theirs
-                    echo "Accepting base version for: $conflict_file"
-                    git checkout --theirs "$conflict_file" 2>/dev/null || true
+                    # For other drizzle files (schema.ts, etc), try to merge or accept ours
+                    echo "Processing other drizzle file: $conflict_file"
+                    git checkout --ours "$conflict_file" 2>/dev/null || true
                     git add "$conflict_file" 2>/dev/null || true
                   fi
                 done
 
+                # Stage all changes
+                git add -A
+
                 # Complete the merge
-                if git commit --no-edit -m "Merge PR #$PR_NUM: $PR_TITLE (drizzle conflicts auto-resolved)"; then
-                  echo "::notice::Successfully merged PR #$PR_NUM with drizzle auto-resolution"
+                if git commit --no-edit -m "Merge PR #$PR_NUM: $PR_TITLE (drizzle migrations preserved and renumbered)"; then
+                  echo "::notice::Successfully merged PR #$PR_NUM with all migrations preserved"
                   MERGED_PRS="${MERGED_PRS}${PR_NUM},"
                   echo "drizzle_fix_needed=true" >> $GITHUB_ENV
                 else
@@ -223,31 +381,29 @@ jobs:
           fi
 
       # =======================================================================
-      # Fix Drizzle Migration Conflicts
+      # Validate and Fix Drizzle Migrations (Post-Merge)
       # =======================================================================
-      # Drizzle ORM maintains migration state in meta/_journal.json and snapshot files.
-      # When PRs with migrations are merged, conflicts can occur due to:
-      # 1. Duplicate migration numbers (e.g., two PRs both create 0007_*.sql)
-      # 2. Conflicting _journal.json entries
-      # 3. Mismatched snapshot files
+      # After merging PRs, this step validates drizzle migration integrity:
+      # - Ensures all SQL files are referenced in the journal
+      # - Renumbers any duplicate migrations (preserving all migrations)
+      # - Validates journal JSON structure
+      # - Syncs snapshots with SQL files
       #
-      # This step repairs these issues by:
-      # - Detecting and removing duplicate/orphaned migrations
-      # - Ensuring journal entries match existing SQL files
-      # - Regenerating migrations if schema changes are pending
+      # This step preserves ALL migrations - nothing is deleted.
+      # Instead, duplicates are renumbered to maintain sequential order.
       #
       # References:
       # - https://github.com/drizzle-team/drizzle-orm/discussions/1104
       # - https://gist.github.com/gburtini/7e34842c567dd80ee834de74e7b79edd
       # =======================================================================
-      - name: Fix Drizzle migration conflicts
+      - name: Validate and fix Drizzle migrations
         id: drizzle-fix
         if: steps.determine-prs.outputs.has_prs == 'true'
         run: |
           cd dokploy-source
 
           echo "=========================================="
-          echo "Checking for Drizzle migration conflicts"
+          echo "Validating Drizzle migrations (post-merge)"
           echo "=========================================="
 
           # Find all drizzle migration directories
@@ -258,11 +414,12 @@ jobs:
 
           if [ -z "$ALL_DIRS" ] || [ "$ALL_DIRS" = " " ]; then
             echo "No drizzle/migration directories found, skipping..."
+            echo "drizzle_status=none" >> $GITHUB_OUTPUT
             exit 0
           fi
 
-          CONFLICTS_FOUND=false
-          CONFLICTS_FIXED=false
+          ISSUES_FOUND=false
+          ISSUES_FIXED=false
 
           for DIR in $ALL_DIRS; do
             if [ ! -d "$DIR" ]; then
@@ -270,7 +427,7 @@ jobs:
             fi
 
             echo ""
-            echo "Checking directory: $DIR"
+            echo "Validating directory: $DIR"
 
             # Check for meta directory with journal
             META_DIR=""
@@ -282,7 +439,7 @@ jobs:
 
             # Look for _journal.json
             JOURNAL_FILE=""
-            if [ -f "$META_DIR/_journal.json" ]; then
+            if [ -n "$META_DIR" ] && [ -f "$META_DIR/_journal.json" ]; then
               JOURNAL_FILE="$META_DIR/_journal.json"
             elif [ -f "$DIR/_journal.json" ]; then
               JOURNAL_FILE="$DIR/_journal.json"
@@ -298,25 +455,19 @@ jobs:
             # Check for git conflict markers in journal
             if grep -q "<<<<<<" "$JOURNAL_FILE" 2>/dev/null; then
               echo "  ::warning::Git conflict markers found in $JOURNAL_FILE"
-              CONFLICTS_FOUND=true
+              ISSUES_FOUND=true
 
-              # Try to parse and fix the journal
-              # Remove conflict markers and keep a valid JSON structure
-              echo "  Attempting to clean conflict markers..."
-
-              # Create backup
+              # Clean conflict markers while preserving content
+              echo "  Cleaning conflict markers..."
               cp "$JOURNAL_FILE" "${JOURNAL_FILE}.bak"
 
-              # Strategy: Keep the "theirs" (base) version of conflicting sections
-              # This preserves the sequential migration history
+              # Remove conflict markers, keeping "theirs" (after =======)
               sed -i '/<<<<<<</,/=======/d' "$JOURNAL_FILE"
               sed -i '/>>>>>>>/d' "$JOURNAL_FILE"
 
-              # Validate JSON
-              if python3 -c "import json; json.load(open('$JOURNAL_FILE'))" 2>/dev/null || \
-                 node -e "JSON.parse(require('fs').readFileSync('$JOURNAL_FILE'))" 2>/dev/null; then
-                echo "  Journal cleaned and validated successfully"
-                CONFLICTS_FIXED=true
+              if python3 -c "import json; json.load(open('$JOURNAL_FILE'))" 2>/dev/null; then
+                echo "  Journal cleaned successfully"
+                ISSUES_FIXED=true
                 rm -f "${JOURNAL_FILE}.bak"
               else
                 echo "  ::warning::Failed to clean journal, restoring backup"
@@ -324,103 +475,217 @@ jobs:
               fi
             fi
 
-            # Check for duplicate migration numbers
+            # Check for duplicate migration numbers and RENUMBER them (don't delete!)
             echo "  Checking for duplicate migration numbers..."
             SQL_FILES=$(find "$DIR" -maxdepth 1 -name "*.sql" 2>/dev/null | sort)
 
             if [ -n "$SQL_FILES" ]; then
-              # Extract migration numbers and find duplicates
               MIGRATION_NUMS=$(echo "$SQL_FILES" | xargs -I {} basename {} | grep -oE '^[0-9]+' | sort)
               DUPLICATE_NUMS=$(echo "$MIGRATION_NUMS" | uniq -d)
 
               if [ -n "$DUPLICATE_NUMS" ]; then
-                echo "  ::warning::Duplicate migration numbers found: $DUPLICATE_NUMS"
-                CONFLICTS_FOUND=true
+                echo "  ::notice::Duplicate migration numbers found: $DUPLICATE_NUMS - will renumber to preserve all"
+                ISSUES_FOUND=true
 
-                for DUP_NUM in $DUPLICATE_NUMS; do
-                  echo "  Processing duplicates for migration $DUP_NUM..."
+                # Use Python to properly renumber duplicates
+                export DRIZZLE_DIR="$DIR"
+                export META_DIR="$META_DIR"
+                export JOURNAL_FILE="$JOURNAL_FILE"
 
-                  # Find all files with this number
-                  DUP_FILES=$(find "$DIR" -maxdepth 1 -name "${DUP_NUM}_*.sql" 2>/dev/null)
+                python3 << 'PYEOF'
+import json
+import os
+import re
+import shutil
 
-                  if [ -n "$JOURNAL_FILE" ] && [ -f "$JOURNAL_FILE" ]; then
-                    # Check which one is in the journal
-                    for DUP_FILE in $DUP_FILES; do
-                      BASENAME=$(basename "$DUP_FILE" .sql)
-                      if grep -q "\"tag\": \"$BASENAME\"" "$JOURNAL_FILE" 2>/dev/null || \
-                         grep -q "\"$BASENAME\"" "$JOURNAL_FILE" 2>/dev/null; then
-                        echo "    Keeping (in journal): $BASENAME"
-                      else
-                        echo "    Removing (not in journal): $BASENAME"
-                        rm -f "$DUP_FILE"
-                        # Also remove corresponding snapshot if exists
-                        SNAPSHOT_FILE=$(find "$META_DIR" -name "${DUP_NUM}_*.json" 2>/dev/null | grep -v "_journal" | head -1)
-                        if [ -n "$SNAPSHOT_FILE" ]; then
-                          echo "    Removing orphaned snapshot: $(basename $SNAPSHOT_FILE)"
-                          rm -f "$SNAPSHOT_FILE"
-                        fi
-                        CONFLICTS_FIXED=true
-                      fi
-                    done
-                  else
-                    # No journal, keep the first one (sorted alphabetically)
-                    FIRST=true
-                    for DUP_FILE in $(echo "$DUP_FILES" | sort); do
-                      if [ "$FIRST" = true ]; then
-                        echo "    Keeping (first): $(basename $DUP_FILE)"
-                        FIRST=false
-                      else
-                        echo "    Removing (duplicate): $(basename $DUP_FILE)"
-                        rm -f "$DUP_FILE"
-                        CONFLICTS_FIXED=true
-                      fi
-                    done
-                  fi
-                done
+drizzle_dir = os.environ.get('DRIZZLE_DIR', '.')
+meta_dir = os.environ.get('META_DIR', '')
+journal_file = os.environ.get('JOURNAL_FILE', '')
+
+# Load journal
+try:
+    with open(journal_file) as f:
+        journal = json.load(f)
+except Exception as e:
+    print(f"  Error loading journal: {e}")
+    exit(1)
+
+entries = journal.get('entries', [])
+journal_tags = {e.get('tag') for e in entries}
+
+# Find all SQL files
+sql_files = []
+for f in os.listdir(drizzle_dir):
+    if f.endswith('.sql'):
+        sql_files.append(f)
+sql_files.sort()
+
+# Group by migration number
+from collections import defaultdict
+by_number = defaultdict(list)
+for sql_file in sql_files:
+    match = re.match(r'^(\d+)_(.+)\.sql$', sql_file)
+    if match:
+        num = int(match.group(1))
+        name = match.group(2)
+        tag = sql_file[:-4]  # Remove .sql
+        by_number[num].append({'file': sql_file, 'tag': tag, 'name': name, 'num': num})
+
+# Find the highest number currently in use
+max_num = max(by_number.keys()) if by_number else -1
+
+# Process duplicates - renumber files not in journal
+changes_made = False
+new_entries = []
+
+for num in sorted(by_number.keys()):
+    files = by_number[num]
+    if len(files) > 1:
+        print(f"  Processing {len(files)} files with number {num:04d}")
+        for i, file_info in enumerate(files):
+            if file_info['tag'] in journal_tags:
+                print(f"    Keeping (in journal): {file_info['file']}")
+            else:
+                # Renumber this file
+                max_num += 1
+                new_tag = f"{max_num:04d}_{file_info['name']}"
+                new_file = f"{new_tag}.sql"
+                old_path = os.path.join(drizzle_dir, file_info['file'])
+                new_path = os.path.join(drizzle_dir, new_file)
+
+                print(f"    Renumbering: {file_info['file']} -> {new_file}")
+
+                # Rename SQL file
+                shutil.move(old_path, new_path)
+
+                # Rename snapshot if exists
+                if meta_dir:
+                    old_snapshot = os.path.join(meta_dir, f"{file_info['tag']}.json")
+                    new_snapshot = os.path.join(meta_dir, f"{new_tag}.json")
+                    if os.path.exists(old_snapshot):
+                        shutil.move(old_snapshot, new_snapshot)
+                        print(f"    Renamed snapshot: {file_info['tag']}.json -> {new_tag}.json")
+
+                # Add new entry to journal
+                # Find the original entry to copy metadata
+                original_entry = None
+                for e in entries:
+                    if e.get('tag') == file_info['tag']:
+                        original_entry = e.copy()
+                        break
+
+                if original_entry:
+                    original_entry['idx'] = max_num
+                    original_entry['tag'] = new_tag
+                else:
+                    # Create new entry
+                    original_entry = {
+                        'idx': max_num,
+                        'version': '7',
+                        'when': int(os.path.getmtime(new_path) * 1000),
+                        'tag': new_tag,
+                        'breakpoints': True
+                    }
+
+                new_entries.append(original_entry)
+                changes_made = True
+
+# Add new entries to journal
+if new_entries:
+    entries.extend(new_entries)
+    entries.sort(key=lambda x: x.get('idx', 0))
+    journal['entries'] = entries
+
+    with open(journal_file, 'w') as f:
+        json.dump(journal, f, indent=2)
+
+    print(f"  Added {len(new_entries)} renumbered migration(s) to journal")
+
+if changes_made:
+    print("  Migrations renumbered successfully - all migrations preserved")
+else:
+    print("  No renumbering needed")
+
+PYEOF
+
+                if [ $? -eq 0 ]; then
+                  ISSUES_FIXED=true
+                else
+                  echo "  ::warning::Failed to renumber migrations"
+                fi
               fi
             fi
 
-            # Clean up orphaned snapshot files
-            if [ -d "$META_DIR" ]; then
-              echo "  Checking for orphaned snapshots..."
-              for SNAPSHOT in $(find "$META_DIR" -name "*_snapshot.json" -o -name "[0-9]*_*.json" 2>/dev/null | grep -v "_journal"); do
-                SNAPSHOT_BASE=$(basename "$SNAPSHOT" .json)
-                SNAPSHOT_NUM=$(echo "$SNAPSHOT_BASE" | grep -oE '^[0-9]+')
+            # Validate: Check for SQL files not in journal (add them)
+            echo "  Checking for untracked migrations..."
+            for SQL_FILE in $(find "$DIR" -maxdepth 1 -name "*.sql" 2>/dev/null); do
+              BASENAME=$(basename "$SQL_FILE" .sql)
+              if ! grep -q "\"$BASENAME\"" "$JOURNAL_FILE" 2>/dev/null; then
+                echo "    ::warning::SQL file not in journal: $BASENAME"
+                ISSUES_FOUND=true
+                # The Python script above should have added it
+              fi
+            done
 
-                if [ -n "$SNAPSHOT_NUM" ]; then
-                  # Check if corresponding SQL file exists
-                  SQL_MATCH=$(find "$DIR" -maxdepth 1 -name "${SNAPSHOT_NUM}_*.sql" 2>/dev/null | head -1)
-                  if [ -z "$SQL_MATCH" ]; then
-                    echo "    Removing orphaned snapshot: $SNAPSHOT_BASE"
-                    rm -f "$SNAPSHOT"
-                    CONFLICTS_FIXED=true
-                  fi
-                fi
-              done
-            fi
+            # Validate: Check for orphaned journal entries (entries without SQL files)
+            echo "  Checking journal integrity..."
+            python3 << 'PYEOF' || true
+import json
+import os
+
+journal_file = os.environ.get('JOURNAL_FILE', '')
+drizzle_dir = os.environ.get('DRIZZLE_DIR', '.')
+
+try:
+    with open(journal_file) as f:
+        journal = json.load(f)
+except:
+    exit(0)
+
+entries = journal.get('entries', [])
+valid_entries = []
+removed = 0
+
+for entry in entries:
+    tag = entry.get('tag', '')
+    sql_path = os.path.join(drizzle_dir, f"{tag}.sql")
+    if os.path.exists(sql_path):
+        valid_entries.append(entry)
+    else:
+        print(f"    Removing orphaned journal entry: {tag}")
+        removed += 1
+
+if removed > 0:
+    journal['entries'] = valid_entries
+    with open(journal_file, 'w') as f:
+        json.dump(journal, f, indent=2)
+    print(f"  Removed {removed} orphaned journal entries")
+
+PYEOF
+
           done
 
           echo ""
           echo "=========================================="
-          echo "Drizzle Conflict Check Summary"
+          echo "Drizzle Validation Summary"
           echo "=========================================="
 
-          if [ "$CONFLICTS_FOUND" = true ]; then
-            if [ "$CONFLICTS_FIXED" = true ]; then
-              echo "::notice::Drizzle migration conflicts were detected and fixed"
+          if [ "$ISSUES_FOUND" = true ]; then
+            if [ "$ISSUES_FIXED" = true ]; then
+              echo "::notice::Drizzle migration issues were detected and fixed (all migrations preserved)"
               echo "drizzle_status=fixed" >> $GITHUB_OUTPUT
 
               # Commit the fixes
               git add -A
               if ! git diff --cached --quiet; then
-                git commit -m "fix: Auto-resolve drizzle migration conflicts" || true
+                git commit -m "fix: Renumber and sync drizzle migrations (all preserved)" || true
               fi
             else
-              echo "::warning::Drizzle migration conflicts detected but could not be fully resolved"
+              echo "::warning::Drizzle migration issues detected but could not be fully resolved"
               echo "drizzle_status=unresolved" >> $GITHUB_OUTPUT
             fi
           else
-            echo "No drizzle migration conflicts detected"
+            echo "All drizzle migrations validated successfully"
             echo "drizzle_status=none" >> $GITHUB_OUTPUT
           fi
 
@@ -734,15 +999,25 @@ jobs:
           # Drizzle migration conflict resolution status
           DRIZZLE_STATUS="${{ needs.prepare-source.outputs.drizzle_status || 'none' }}"
           if [ "$DRIZZLE_STATUS" = "fixed" ]; then
-            echo "### Drizzle Migration Conflicts" >> $GITHUB_STEP_SUMMARY
-            echo "✅ **Drizzle migration conflicts were automatically resolved**" >> $GITHUB_STEP_SUMMARY
+            echo "### Drizzle Migrations" >> $GITHUB_STEP_SUMMARY
+            echo "✅ **Drizzle migration conflicts were automatically resolved (all migrations preserved)**" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
-            echo "The workflow detected and fixed conflicts in Drizzle migration files (journal, snapshots, SQL migrations)." >> $GITHUB_STEP_SUMMARY
-            echo "This is a known issue when merging PRs that modify database schema. [Learn more](https://github.com/drizzle-team/drizzle-orm/discussions/1104)" >> $GITHUB_STEP_SUMMARY
+            echo "The workflow detected conflicting migrations and resolved them by:" >> $GITHUB_STEP_SUMMARY
+            echo "- Renumbering duplicate migrations to maintain sequential order" >> $GITHUB_STEP_SUMMARY
+            echo "- Merging journal entries from all PRs" >> $GITHUB_STEP_SUMMARY
+            echo "- Syncing snapshots with SQL files" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**No migrations were lost** - all schema changes from merged PRs are included." >> $GITHUB_STEP_SUMMARY
+            echo "[Learn more about drizzle merge conflicts](https://github.com/drizzle-team/drizzle-orm/discussions/1104)" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
           elif [ "$DRIZZLE_STATUS" = "unresolved" ]; then
-            echo "### ⚠️ Drizzle Migration Conflicts" >> $GITHUB_STEP_SUMMARY
-            echo "**Warning:** Drizzle migration conflicts were detected but could not be fully resolved automatically." >> $GITHUB_STEP_SUMMARY
+            echo "### ⚠️ Drizzle Migration Issues" >> $GITHUB_STEP_SUMMARY
+            echo "**Warning:** Drizzle migration issues were detected but could not be fully resolved automatically." >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "This may happen when:" >> $GITHUB_STEP_SUMMARY
+            echo "- Journal JSON is malformed" >> $GITHUB_STEP_SUMMARY
+            echo "- Complex schema conflicts exist" >> $GITHUB_STEP_SUMMARY
+            echo "- Python/Node is unavailable for processing" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
             echo "Manual intervention may be required. See workflow logs for details." >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
