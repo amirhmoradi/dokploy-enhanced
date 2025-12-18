@@ -49,6 +49,8 @@ jobs:
       merged_prs: ${{ steps.merge-prs.outputs.merged_prs }}
       failed_prs: ${{ steps.merge-prs.outputs.failed_prs }}
       build_version: ${{ steps.meta.outputs.build_version }}
+      enhanced_version_tag: ${{ steps.meta.outputs.enhanced_version_tag }}
+      upstream_release: ${{ steps.meta.outputs.upstream_release }}
       upstream_sha: ${{ steps.clone.outputs.upstream_sha }}
 
     steps:
@@ -181,17 +183,43 @@ jobs:
           BUILD_DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
           BUILD_VERSION=$(date -u +"%Y%m%d")
 
+          echo "Fetching latest upstream release tag..."
+          LATEST_RELEASE=$(curl -s -H "Accept: application/vnd.github+json" "https://api.github.com/repos/${{ env.UPSTREAM_REPO }}/releases/latest" | jq -r '.tag_name')
+
+          if [ -z "$LATEST_RELEASE" ] || [ "$LATEST_RELEASE" = "null" ]; then
+            echo "::warning::Unable to determine latest upstream release; defaulting to branch name"
+            LATEST_RELEASE="${{ inputs.dokploy_branch || env.UPSTREAM_BRANCH }}"
+          fi
+
+          echo "Latest upstream release: $LATEST_RELEASE"
+
+          MERGED_PRS="${{ steps.merge-prs.outputs.merged_prs || '' }}"
+          CLEANED_MERGED=$(echo "$MERGED_PRS" | tr -d ' ')
+
+          if [ -n "$CLEANED_MERGED" ]; then
+            PR_SUFFIX=$(echo "$CLEANED_MERGED" | tr ',' '-')
+            ENHANCED_TAG="${LATEST_RELEASE}.pr-${PR_SUFFIX}"
+          else
+            ENHANCED_TAG="$LATEST_RELEASE"
+          fi
+
+          echo "Enhanced version tag: $ENHANCED_TAG"
+
           echo "build_date=$BUILD_DATE" >> $GITHUB_OUTPUT
           echo "build_version=$BUILD_VERSION" >> $GITHUB_OUTPUT
+          echo "upstream_release=$LATEST_RELEASE" >> $GITHUB_OUTPUT
+          echo "enhanced_version_tag=$ENHANCED_TAG" >> $GITHUB_OUTPUT
 
           # Create version info file in the source
           cat > dokploy-source/ENHANCED_VERSION.json << EOF
           {
             "build_date": "$BUILD_DATE",
             "build_version": "$BUILD_VERSION",
+            "upstream_release": "$LATEST_RELEASE",
             "upstream_sha": "${{ steps.clone.outputs.upstream_sha }}",
             "upstream_repo": "${{ env.UPSTREAM_REPO }}",
             "upstream_branch": "${{ inputs.dokploy_branch || env.UPSTREAM_BRANCH }}",
+            "enhanced_version_tag": "$ENHANCED_TAG",
             "merged_prs": "${{ steps.merge-prs.outputs.merged_prs || '' }}",
             "failed_prs": "${{ steps.merge-prs.outputs.failed_prs || '' }}",
             "repository": "${{ github.repository }}",
@@ -327,7 +355,7 @@ jobs:
           file: ./dokploy-source/Dockerfile
           platforms: linux/amd64
           push: true
-          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.prepare-source.outputs.build_version }}-amd64
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.prepare-source.outputs.build_version }}-amd64,${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.prepare-source.outputs.enhanced_version_tag }}-amd64
           cache-from: type=gha,scope=amd64
           cache-to: type=gha,mode=max,scope=amd64
 
@@ -369,7 +397,7 @@ jobs:
           file: ./dokploy-source/Dockerfile
           platforms: linux/arm64
           push: true
-          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.prepare-source.outputs.build_version }}-arm64
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.prepare-source.outputs.build_version }}-arm64,${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.prepare-source.outputs.enhanced_version_tag }}-arm64
           cache-from: type=gha,scope=arm64
           cache-to: type=gha,mode=max,scope=arm64
 
@@ -394,12 +422,18 @@ jobs:
       - name: Create and push multi-arch manifests
         run: |
           BUILD_VERSION="${{ needs.prepare-source.outputs.build_version }}"
+          ENHANCED_VERSION="${{ needs.prepare-source.outputs.enhanced_version_tag }}"
           IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
 
           echo "Creating multi-arch manifests for version: $BUILD_VERSION"
 
           # Create manifest for the dated version
           docker buildx imagetools create -t ${IMAGE}:${BUILD_VERSION} \
+            ${IMAGE}:${BUILD_VERSION}-amd64 \
+            ${IMAGE}:${BUILD_VERSION}-arm64
+
+          # Create manifest for the enhanced upstream/PR version tag
+          docker buildx imagetools create -t ${IMAGE}:${ENHANCED_VERSION} \
             ${IMAGE}:${BUILD_VERSION}-amd64 \
             ${IMAGE}:${BUILD_VERSION}-arm64
 
@@ -450,6 +484,14 @@ jobs:
           echo "| Failed to Merge | ${{ needs.prepare-source.outputs.failed_prs || 'None' }} |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
 
+          echo "### Version Tags" >> $GITHUB_STEP_SUMMARY
+          echo "| Description | Tag |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------------|-----|" >> $GITHUB_STEP_SUMMARY
+          echo "| Latest upstream release | \`${{ needs.prepare-source.outputs.upstream_release }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Enhanced build tag | \`${{ needs.prepare-source.outputs.enhanced_version_tag }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Date-based build tag | \`${{ needs.prepare-source.outputs.build_version }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
           if [ "${{ inputs.skip_build }}" != "true" ]; then
             echo "### Docker Images" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
@@ -458,6 +500,7 @@ jobs:
             echo "| Tag | Description |" >> $GITHUB_STEP_SUMMARY
             echo "|-----|-------------|" >> $GITHUB_STEP_SUMMARY
             echo "| \`latest\` | Most recent build |" >> $GITHUB_STEP_SUMMARY
+            echo "| \`${{ needs.prepare-source.outputs.enhanced_version_tag }}\` | Upstream release + merged PRs |" >> $GITHUB_STEP_SUMMARY
             echo "| \`${{ needs.prepare-source.outputs.build_version }}\` | Date-versioned build |" >> $GITHUB_STEP_SUMMARY
             echo "| \`canary\` | Canary channel (if applicable) |" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
