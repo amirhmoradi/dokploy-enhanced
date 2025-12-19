@@ -34,7 +34,7 @@ set -euo pipefail
 # Configuration
 # =============================================================================
 
-readonly SCRIPT_VERSION="2.2.0"
+readonly SCRIPT_VERSION="2.3.0"
 readonly SCRIPT_NAME="dokploy-enhanced-installer"
 
 # Default configuration
@@ -46,9 +46,9 @@ readonly DEFAULT_DATA_DIR="/etc/dokploy"
 readonly DEFAULT_DEPLOY_MODE="standalone"  # standalone or swarm
 readonly STACK_NAME="dokploy"
 
-# Docker image versions
+# Docker image and versions
 readonly POSTGRES_VERSION="16"
-readonly REDIS_VERSION="7"
+readonly REDIS_IMAGE="docker.dragonflydb.io/dragonflydb/dragonfly"
 readonly TRAEFIK_VERSION="v3.1.6"
 
 # Network configuration
@@ -485,6 +485,9 @@ generate_env_file() {
 # Generated on $(date -u +"%Y-%m-%dT%H:%M:%SZ")
 # =============================================================================
 
+# DOKPLOY Settings
+TZ=Europe/Paris
+
 # Deployment Mode (standalone or swarm)
 DEPLOY_MODE=${deploy_mode}
 
@@ -507,10 +510,13 @@ POSTGRES_PASSWORD=${pg_password}
 DATABASE_URL=postgresql://dokploy:${pg_password}@postgres:5432/dokploy
 
 # Redis
-REDIS_URL=redis://redis:6379
+REDIS_HOST=redis
 
 # Traefik (true/false)
 TRAEFIK_ENABLED=${traefik_enabled}
+TRAEFIK_SSL_PORT=443
+TRAEFIK_PORT=80
+
 EOF
 
     chmod 600 "$env_file"
@@ -559,7 +565,8 @@ services:
     environment:
       - ADVERTISE_ADDR=\${ADVERTISE_ADDR}
       - DATABASE_URL=\${DATABASE_URL}
-      - REDIS_URL=\${REDIS_URL}
+      - REDIS_HOST=\${REDIS_HOST}
+      - TZ=\${TZ}
     depends_on:
       - postgres
       - redis
@@ -595,7 +602,9 @@ services:
   # Redis - Cache & Queue
   # ===========================================================================
   redis:
-    image: redis:${REDIS_VERSION}
+    image: ${REDIS_IMAGE}
+    ulimits:
+      memlock: -1
     container_name: dokploy-redis
     restart: unless-stopped
     networks:
@@ -970,7 +979,7 @@ cmd_update() {
         # Pull images first
         docker pull "${DOKPLOY_REGISTRY:-$DEFAULT_REGISTRY}/${DOKPLOY_IMAGE:-$DEFAULT_IMAGE}:${DOKPLOY_VERSION:-$DEFAULT_VERSION}"
         docker pull "postgres:${POSTGRES_VERSION}"
-        docker pull "redis:${REDIS_VERSION}"
+        docker pull "${REDIS_IMAGE}"
         docker pull "traefik:${TRAEFIK_VERSION}"
         # Redeploy stack
         stack_deploy
