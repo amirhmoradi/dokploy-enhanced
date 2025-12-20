@@ -34,7 +34,7 @@ set -euo pipefail
 # Configuration
 # =============================================================================
 
-readonly SCRIPT_VERSION="2.3.0"
+readonly SCRIPT_VERSION="2.4.0"
 readonly SCRIPT_NAME="dokploy-enhanced-installer"
 
 # Default configuration
@@ -48,8 +48,8 @@ readonly STACK_NAME="dokploy"
 
 # Docker image and versions
 readonly POSTGRES_VERSION="16"
-readonly REDIS_IMAGE="docker.dragonflydb.io/dragonflydb/dragonfly"
-readonly TRAEFIK_VERSION="v3.1.6"
+readonly REDIS_IMAGE="valkey/valkey:alpine"
+readonly TRAEFIK_VERSION="v3.6.5"
 
 # Network configuration
 readonly NETWORK_NAME="dokploy-network"
@@ -599,23 +599,26 @@ services:
       retries: 5
 
   # ===========================================================================
-  # Redis - Cache & Queue
+  # Valkey - Cache & Queue (Redis-compatible)
   # ===========================================================================
   redis:
     image: ${REDIS_IMAGE}
-    ulimits:
-      memlock: -1
     container_name: dokploy-redis
     restart: unless-stopped
     networks:
       - dokploy-network
     volumes:
       - dokploy-redis:/data
+    # Optional but recommended: enable AOF persistence for queue durability
+    command: ["valkey-server", "--appendonly", "yes", "--dir", "/data"]
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      # Some images ship valkey-cli; some environments still have redis-cli.
+      # CMD-SHELL lets us be resilient.
+      test: ["CMD-SHELL", "valkey-cli ping | grep -q PONG || redis-cli ping | grep -q PONG"]
       interval: 10s
       timeout: 5s
       retries: 5
+
 EOF
 
     # Conditionally add Traefik service
