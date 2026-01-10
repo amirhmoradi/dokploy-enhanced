@@ -196,13 +196,31 @@ class MigrationManager:
                     sql_files[tag] = f
                     state.max_idx = max(state.max_idx, idx)
 
-        # Find all snapshot files
+        # Find all snapshot files (handles both naming conventions)
+        # Convention 1: {idx}_snapshot.json (newer Drizzle)
+        # Convention 2: {tag}.json where tag matches migration tag (older Drizzle)
         snapshot_files = {}
+        idx_snapshot_pattern = re.compile(r"^(\d+)_snapshot$")
         if self.meta_dir.exists():
             for f in self.meta_dir.iterdir():
                 if f.is_file() and f.suffix == ".json" and f.name != "_journal.json":
-                    tag = f.stem
-                    snapshot_files[tag] = f
+                    stem = f.stem
+                    # Check if it's an index-based snapshot (e.g., 0134_snapshot)
+                    idx_match = idx_snapshot_pattern.match(stem)
+                    if idx_match:
+                        # Map index-based snapshots to any migration with that index
+                        idx = int(idx_match.group(1))
+                        # Find the tag for this index from sql_files
+                        for tag in sql_files:
+                            if tag.startswith(f"{idx:04d}_"):
+                                snapshot_files[tag] = f
+                                break
+                        else:
+                            # No matching SQL file, store with artificial tag
+                            snapshot_files[f"{idx:04d}_snapshot"] = f
+                    else:
+                        # Tag-based snapshot
+                        snapshot_files[stem] = f
 
         # Build migration objects
         all_tags = set(journal_entries.keys()) | set(sql_files.keys()) | set(snapshot_files.keys())
@@ -348,6 +366,12 @@ class MigrationManager:
         success = True
         changes = []
 
+        # Extract index numbers from tags (e.g., "0134_name" -> 134)
+        old_idx_match = re.match(r"^(\d+)", old_tag)
+        new_idx_match = re.match(r"^(\d+)", new_tag)
+        old_idx = old_idx_match.group(1) if old_idx_match else None
+        new_idx = new_idx_match.group(1) if new_idx_match else None
+
         # Rename SQL file
         old_sql = self.drizzle_dir / f"{old_tag}.sql"
         new_sql = self.drizzle_dir / f"{new_tag}.sql"
@@ -359,7 +383,20 @@ class MigrationManager:
                 self.log(f"Failed to rename SQL: {e}", "error")
                 success = False
 
-        # Rename snapshot file
+        # Rename snapshot file - try both naming conventions
+        # Convention 1: {idx}_snapshot.json (newer Drizzle versions)
+        if old_idx and new_idx:
+            old_snapshot_idx = self.meta_dir / f"{old_idx}_snapshot.json"
+            new_snapshot_idx = self.meta_dir / f"{new_idx}_snapshot.json"
+            if old_snapshot_idx.exists():
+                try:
+                    shutil.move(str(old_snapshot_idx), str(new_snapshot_idx))
+                    changes.append(f"Snapshot: {old_idx}_snapshot.json → {new_idx}_snapshot.json")
+                except Exception as e:
+                    self.log(f"Failed to rename snapshot (idx): {e}", "error")
+                    success = False
+
+        # Convention 2: {tag}.json (older Drizzle versions)
         old_snapshot = self.meta_dir / f"{old_tag}.json"
         new_snapshot = self.meta_dir / f"{new_tag}.json"
         if old_snapshot.exists():

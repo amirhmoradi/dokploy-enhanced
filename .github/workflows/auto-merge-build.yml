@@ -256,6 +256,10 @@ jobs:
                       if [ -f /tmp/drizzle_rename_map.txt ] && [ -s /tmp/drizzle_rename_map.txt ]; then
                         while IFS='|' read -r old_tag new_tag; do
                           if [ -n "$old_tag" ] && [ -n "$new_tag" ]; then
+                            # Extract index numbers from tags (e.g., "0134_name" -> "0134")
+                            OLD_IDX=$(echo "$old_tag" | grep -oE '^[0-9]+')
+                            NEW_IDX=$(echo "$new_tag" | grep -oE '^[0-9]+')
+
                             # Rename SQL file
                             OLD_SQL="$DRIZZLE_DIR/${old_tag}.sql"
                             NEW_SQL="$DRIZZLE_DIR/${new_tag}.sql"
@@ -264,13 +268,32 @@ jobs:
                               git mv "$OLD_SQL" "$NEW_SQL" 2>/dev/null || mv "$OLD_SQL" "$NEW_SQL"
                             fi
 
-                            # Rename snapshot file
+                            # Create new snapshot file from extracted PR snapshot
+                            # (PR's snapshot was saved to /tmp/pr_snapshot_{idx}.json during conflict resolution)
                             META_DIR="$DRIZZLE_DIR/meta"
-                            OLD_SNAPSHOT="$META_DIR/${old_tag}.json"
-                            NEW_SNAPSHOT="$META_DIR/${new_tag}.json"
-                            if [ -f "$OLD_SNAPSHOT" ]; then
-                              echo "  Renaming snapshot: ${old_tag}.json -> ${new_tag}.json"
-                              git mv "$OLD_SNAPSHOT" "$NEW_SNAPSHOT" 2>/dev/null || mv "$OLD_SNAPSHOT" "$NEW_SNAPSHOT"
+                            PR_SNAPSHOT_TEMP="/tmp/pr_snapshot_${OLD_IDX}.json"
+                            NEW_SNAPSHOT="$META_DIR/${NEW_IDX}_snapshot.json"
+
+                            if [ -f "$PR_SNAPSHOT_TEMP" ]; then
+                              echo "  Creating new snapshot: ${NEW_IDX}_snapshot.json (from extracted PR snapshot)"
+                              cp "$PR_SNAPSHOT_TEMP" "$NEW_SNAPSHOT"
+                              git add "$NEW_SNAPSHOT"
+                            elif [ -f "$META_DIR/${OLD_IDX}_snapshot.json" ]; then
+                              # Fallback: try direct rename if no temp file (older behavior)
+                              echo "  Renaming snapshot: ${OLD_IDX}_snapshot.json -> ${NEW_IDX}_snapshot.json"
+                              git mv "$META_DIR/${OLD_IDX}_snapshot.json" "$NEW_SNAPSHOT" 2>/dev/null || mv "$META_DIR/${OLD_IDX}_snapshot.json" "$NEW_SNAPSHOT"
+                              git add "$NEW_SNAPSHOT"
+                            else
+                              echo "  ::warning::No snapshot found for migration ${OLD_IDX}"
+                            fi
+
+                            # Also check for tag-based snapshot naming (fallback for older Drizzle versions)
+                            OLD_SNAPSHOT_ALT="$META_DIR/${old_tag}.json"
+                            NEW_SNAPSHOT_ALT="$META_DIR/${new_tag}.json"
+                            if [ -f "$OLD_SNAPSHOT_ALT" ]; then
+                              echo "  Renaming snapshot (alt): ${old_tag}.json -> ${new_tag}.json"
+                              git mv "$OLD_SNAPSHOT_ALT" "$NEW_SNAPSHOT_ALT" 2>/dev/null || mv "$OLD_SNAPSHOT_ALT" "$NEW_SNAPSHOT_ALT"
+                              git add "$NEW_SNAPSHOT_ALT"
                             fi
                           fi
                         done < /tmp/drizzle_rename_map.txt
@@ -283,12 +306,31 @@ jobs:
                       git add "$conflict_file" 2>/dev/null || true
                     fi
 
-                  elif echo "$conflict_file" | grep -qE "_snapshot\.json$|\.snapshot\.json$"; then
-                    # For snapshot conflicts, we'll handle them after journal is processed
-                    # Accept ours for now, will be fixed by renaming step above
-                    echo "Processing snapshot conflict: $conflict_file (will be handled with journal)"
-                    git checkout --ours "$conflict_file" 2>/dev/null || true
-                    git add "$conflict_file" 2>/dev/null || true
+                  elif echo "$conflict_file" | grep -qE "_snapshot\.json$"; then
+                    # For snapshot conflicts with {idx}_snapshot.json naming:
+                    # - Extract PR's version (ours) to temp location
+                    # - Keep base's version (theirs) at original path
+                    # - PR's snapshot will be renamed to new index later
+                    echo "Processing snapshot conflict: $conflict_file"
+
+                    # Extract the index from the filename (e.g., 0134 from 0134_snapshot.json)
+                    SNAPSHOT_BASENAME=$(basename "$conflict_file")
+                    SNAPSHOT_IDX=$(echo "$SNAPSHOT_BASENAME" | grep -oE '^[0-9]+')
+
+                    if [ -n "$SNAPSHOT_IDX" ]; then
+                      # Save PR's version to temp with its index for later renaming
+                      echo "  Extracting PR's snapshot for later renaming..."
+                      git show :3:"$conflict_file" > "/tmp/pr_snapshot_${SNAPSHOT_IDX}.json" 2>/dev/null || true
+
+                      # Keep base's version (theirs) at the original path
+                      echo "  Keeping base's snapshot at $conflict_file"
+                      git checkout --theirs "$conflict_file" 2>/dev/null || true
+                      git add "$conflict_file" 2>/dev/null || true
+                    else
+                      # Fallback: just accept ours
+                      git checkout --ours "$conflict_file" 2>/dev/null || true
+                      git add "$conflict_file" 2>/dev/null || true
+                    fi
 
                   elif echo "$conflict_file" | grep -qE "\.sql$"; then
                     # For SQL migration files, keep ours (PR version) - will be renumbered
@@ -486,6 +528,93 @@ jobs:
             echo "All drizzle migrations validated successfully"
             echo "drizzle_status=none" >> $GITHUB_OUTPUT
           fi
+
+      # =======================================================================
+      # Regenerate Drizzle Snapshots Using drizzle-kit (The Dokploy Way)
+      # =======================================================================
+      # After file renumbering, use drizzle-kit to ensure snapshots are valid.
+      # This runs `drizzle-kit up` to update migration metadata to latest format.
+      # =======================================================================
+      - name: Setup Node.js for drizzle-kit
+        if: env.drizzle_fix_needed == 'true' || steps.drizzle-fix.outputs.drizzle_status == 'fixed'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Setup pnpm
+        if: env.drizzle_fix_needed == 'true' || steps.drizzle-fix.outputs.drizzle_status == 'fixed'
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Regenerate Drizzle snapshots
+        id: drizzle-regenerate
+        if: env.drizzle_fix_needed == 'true' || steps.drizzle-fix.outputs.drizzle_status == 'fixed'
+        run: |
+          cd dokploy-source
+
+          echo "=========================================="
+          echo "Regenerating Drizzle snapshots (drizzle-kit)"
+          echo "=========================================="
+
+          # Install dependencies (needed for drizzle-kit)
+          echo "Installing dependencies..."
+          pnpm install --frozen-lockfile || pnpm install
+
+          # Find drizzle config files
+          DRIZZLE_CONFIGS=$(find . -name "drizzle.config.*" -type f 2>/dev/null | head -10)
+
+          if [ -z "$DRIZZLE_CONFIGS" ]; then
+            echo "No drizzle.config files found, skipping regeneration"
+            exit 0
+          fi
+
+          for CONFIG in $DRIZZLE_CONFIGS; do
+            echo ""
+            echo "Processing config: $CONFIG"
+            CONFIG_DIR=$(dirname "$CONFIG")
+
+            # Change to the directory containing the config
+            cd "$CONFIG_DIR" 2>/dev/null || continue
+
+            # Run drizzle-kit up to update migration metadata
+            echo "  Running drizzle-kit up..."
+            if npx drizzle-kit up --config "$(basename "$CONFIG")" 2>&1; then
+              echo "  ✓ drizzle-kit up completed successfully"
+            else
+              echo "  ::warning::drizzle-kit up had issues (non-fatal)"
+            fi
+
+            # Return to source root
+            cd - > /dev/null
+          done
+
+          # Also try running from apps/dokploy if it exists (Dokploy's main app)
+          if [ -d "apps/dokploy" ]; then
+            echo ""
+            echo "Running drizzle-kit from apps/dokploy..."
+            cd apps/dokploy
+
+            if [ -f "server/db/drizzle.config.ts" ] || [ -f "drizzle.config.ts" ]; then
+              echo "  Running pnpm migration:up (if available)..."
+              pnpm run migration:up 2>&1 || npx drizzle-kit up 2>&1 || true
+            fi
+
+            cd ../..
+          fi
+
+          # Commit any changes from drizzle-kit
+          git add -A
+          if ! git diff --cached --quiet; then
+            echo ""
+            echo "Committing drizzle-kit updates..."
+            git commit -m "fix: Regenerate drizzle migration snapshots via drizzle-kit" || true
+          fi
+
+          echo ""
+          echo "=========================================="
+          echo "Drizzle regeneration complete"
+          echo "=========================================="
 
       - name: Generate build metadata
         id: meta

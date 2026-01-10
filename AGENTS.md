@@ -159,10 +159,10 @@ def merge_journals(upstream_path: str, pr_path: str) -> dict:
 ## Architecture Notes
 
 1. **PR Merging**: Workflow fetches PRs by number, attempts merge, uses lazy rebase on conflict
-2. **Drizzle Conflicts**: `drizzle_migration_manager.py` handles migration conflicts:
-   - Detects index collisions (e.g., `0134_abc` and `0134_xyz` from different PRs)
-   - Atomically renumbers migrations with backup/restore capability
-   - Updates journal, SQL files, and snapshot references together
+2. **Drizzle Conflicts**: Two-phase migration conflict resolution:
+   - **Phase 1** (`drizzle_migration_manager.py`): Renumber conflicting files, update journal
+   - **Phase 2** (`drizzle-kit up`): Regenerate snapshots using Dokploy's tooling
+   - Handles both snapshot naming conventions: `{idx}_snapshot.json` and `{tag}.json`
    - Validates integrity after changes
 3. **Multi-arch Builds**: Separate builds for amd64/arm64, combined with manifest
 4. **Install Script**: Generates `docker-compose.yml` and `.env` at `/etc/dokploy/`

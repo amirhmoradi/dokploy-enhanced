@@ -90,12 +90,18 @@ The GitHub Actions workflow (`auto-merge-build.yml`):
 
 ## Key Technical Details
 
-- **Drizzle migrations**: When merging PRs with database migrations, the `drizzle_migration_manager.py` script handles conflicts:
-  - Detects index collisions (e.g., `0134_abc` and `0134_xyz`)
-  - Renumbers conflicting migrations atomically
-  - Updates journal entries, SQL files, and snapshot references
-  - Supports modes: `fix` (resolve conflicts), `validate` (check integrity), `cleanup` (remove orphans)
-  - Creates backups before modifications for rollback capability
+- **Drizzle migrations**: When merging PRs with database migrations, a multi-phase approach handles conflicts:
+  - **Phase 1 - Conflict Resolution** (workflow):
+    - Extracts PR's snapshot to temp before resolving conflict (preserves both versions)
+    - Keeps base's snapshot at original index, creates PR's at new index
+    - Merges journals and renumbers PR migrations to next available index
+  - **Phase 2 - File Renaming** (`drizzle_migration_manager.py`):
+    - Renames SQL files with new index
+    - Creates new snapshot from extracted PR version
+    - Handles both naming conventions: `{idx}_snapshot.json` and `{tag}.json`
+  - **Phase 3 - Validation** (drizzle-kit):
+    - Runs `drizzle-kit up` to update migration metadata format
+    - Uses Dokploy's tooling to ensure snapshots are valid
 - **Docker Swarm**: install.sh initializes Docker Swarm for overlay networking
 - **Traefik**: Optional reverse proxy with Let's Encrypt SSL
 - **PostgreSQL 16 + Valkey (Redis)**: Data persistence layer
