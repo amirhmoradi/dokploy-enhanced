@@ -746,6 +746,24 @@ jobs:
           echo "package.json packageManager field:"
           grep "packageManager" package.json || echo "No packageManager in package.json"
 
+      - name: Clean up before upload
+        run: |
+          cd dokploy-source
+          echo "Cleaning up build artifacts before upload..."
+
+          # Remove node_modules (will be reinstalled in Docker build)
+          find . -name "node_modules" -type d -prune -exec rm -rf {} + 2>/dev/null || true
+
+          # Remove pnpm store
+          rm -rf .pnpm-store 2>/dev/null || true
+
+          # Remove any lock files that might cause issues
+          # (pnpm-lock.yaml should be kept for reproducible builds)
+
+          # Show final size
+          echo "Final source size:"
+          du -sh . || true
+
       - name: Upload prepared source
         uses: actions/upload-artifact@v4
         with:
