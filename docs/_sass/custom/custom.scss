@@ -1,0 +1,129 @@
+// Custom styles for Dokploy Enhanced documentation
+
+// Override theme colors for dark mode
+:root {
+  --color-primary: #7c3aed;
+  --color-primary-light: #a78bfa;
+  --color-accent: #2563eb;
+}
+
+// Hero section styling
+.fs-9 {
+  background: linear-gradient(135deg, #7c3aed 0%, #2563eb 100%);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+
+// Improve button styling
+.btn-primary {
+  background: linear-gradient(135deg, #7c3aed 0%, #2563eb 100%);
+  border: none;
+
+  &:hover {
+    background: linear-gradient(135deg, #6d28d9 0%, #1d4ed8 100%);
+    transform: translateY(-1px);
+  }
+}
+
+// Code block improvements
+pre.highlight {
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+// Table styling improvements
+table {
+  border-radius: 8px;
+  overflow: hidden;
+
+  th {
+    background: rgba(124, 58, 237, 0.2);
+  }
+}
+
+// Callout styling
+.warning, .highlight, .note, .important {
+  border-radius: 8px;
+  border-left-width: 4px;
+}
+
+// ASCII diagram styling
+pre:not(.highlight) {
+  background: rgba(0, 0, 0, 0.3);
+  border-radius: 8px;
+  padding: 1rem;
+  font-size: 0.85rem;
+  overflow-x: auto;
+}
+
+// Navigation improvements
+.site-nav {
+  .nav-link {
+    border-radius: 4px;
+    transition: all 0.2s ease;
+
+    &:hover {
+      background: rgba(124, 58, 237, 0.1);
+    }
+
+    &.active {
+      background: rgba(124, 58, 237, 0.2);
+      border-left: 3px solid #7c3aed;
+    }
+  }
+}
+
+// Footer styling
+.site-footer {
+  border-top: 1px solid rgba(255, 255, 255, 0.1);
+  padding-top: 2rem;
+  margin-top: 3rem;
+}
+
+// Smooth scrolling
+html {
+  scroll-behavior: smooth;
+}
+
+// TOC styling
+.toc {
+  border-radius: 8px;
+  background: rgba(0, 0, 0, 0.2);
+  padding: 1rem;
+
+  summary {
+    cursor: pointer;
+    font-weight: 600;
+  }
+}
+
+// Feature grid for homepage
+.d-flex.flex-justify-around {
+  gap: 1rem;
+
+  > div {
+    background: rgba(124, 58, 237, 0.1);
+    border-radius: 12px;
+    padding: 1.5rem;
+    min-width: 150px;
+    transition: transform 0.2s ease;
+
+    &:hover {
+      transform: translateY(-2px);
+      background: rgba(124, 58, 237, 0.15);
+    }
+  }
+}
+
+// Responsive improvements
+@media (max-width: 768px) {
+  .fs-9 {
+    font-size: 2rem !important;
+  }
+
+  .d-flex.flex-justify-around {
+    flex-direction: column;
+    align-items: center;
+  }
+}

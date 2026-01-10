@@ -241,8 +241,10 @@ jobs:
 
                     echo "  Base journal max index: $BASE_MAX_IDX"
 
-                    # Find PR-specific entries and renumber them to continue after base
-                    python3 ../.github/scripts/merge_drizzle_journals.py
+                    # Use the comprehensive migration manager to merge journals
+                    export THEIRS_JOURNAL=/tmp/theirs_journal.json
+                    export OURS_JOURNAL=/tmp/ours_journal.json
+                    python3 ../.github/scripts/drizzle_migration_manager.py "$DRIZZLE_DIR" --mode merge --verbose
 
                     # Check if python script succeeded
                     if [ $? -eq 0 ] && [ -f /tmp/merged_journal.json ]; then
@@ -438,47 +440,26 @@ jobs:
               fi
             fi
 
-            # Check for duplicate migration numbers and RENUMBER them (don't delete!)
-            echo "  Checking for duplicate migration numbers..."
-            SQL_FILES=$(find "$DIR" -maxdepth 1 -name "*.sql" 2>/dev/null | sort)
+            # Use the comprehensive migration manager to fix conflicts and validate
+            echo "  Running migration manager (fix mode)..."
 
-            if [ -n "$SQL_FILES" ]; then
-              MIGRATION_NUMS=$(echo "$SQL_FILES" | xargs -I {} basename {} | grep -oE '^[0-9]+' | sort)
-              DUPLICATE_NUMS=$(echo "$MIGRATION_NUMS" | uniq -d)
-
-              if [ -n "$DUPLICATE_NUMS" ]; then
-                echo "  ::notice::Duplicate migration numbers found: $DUPLICATE_NUMS - will renumber to preserve all"
-                ISSUES_FOUND=true
-
-                # Use Python to properly renumber duplicates
-                export DRIZZLE_DIR="$DIR"
-                export META_DIR="$META_DIR"
-                export JOURNAL_FILE="$JOURNAL_FILE"
-
-                python3 ../.github/scripts/renumber_drizzle_migrations.py
-
-                if [ $? -eq 0 ]; then
-                  ISSUES_FIXED=true
-                else
-                  echo "  ::warning::Failed to renumber migrations"
-                fi
-              fi
+            # Run the comprehensive migration manager
+            if python3 ../.github/scripts/drizzle_migration_manager.py "$DIR" --mode fix --verbose; then
+              echo "  Migration manager completed successfully"
+              ISSUES_FIXED=true
+            else
+              echo "  ::warning::Migration manager reported issues"
+              ISSUES_FOUND=true
             fi
 
-            # Validate: Check for SQL files not in journal (add them)
-            echo "  Checking for untracked migrations..."
-            for SQL_FILE in $(find "$DIR" -maxdepth 1 -name "*.sql" 2>/dev/null); do
-              BASENAME=$(basename "$SQL_FILE" .sql)
-              if ! grep -q "\"$BASENAME\"" "$JOURNAL_FILE" 2>/dev/null; then
-                echo "    ::warning::SQL file not in journal: $BASENAME"
-                ISSUES_FOUND=true
-                # The Python script above should have added it
-              fi
-            done
-
-            # Validate: Check for orphaned journal entries (entries without SQL files)
-            echo "  Checking journal integrity..."
-            python3 ../.github/scripts/cleanup_drizzle_journal.py || true
+            # Final validation
+            echo "  Running final validation..."
+            if python3 ../.github/scripts/drizzle_migration_manager.py "$DIR" --mode validate; then
+              echo "  Validation passed"
+            else
+              echo "  ::warning::Validation found issues"
+              ISSUES_FOUND=true
+            fi
 
           done
 
